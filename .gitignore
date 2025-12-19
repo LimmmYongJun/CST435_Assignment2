@@ -1,0 +1,34 @@
+# ============================================================================
+# CST435 Assignment 2 - Parallel Image Processing
+# ============================================================================
+
+# Output images (processed results - do not track)
+output_images/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Assignment documents
+ass_requirements.txt
+*.pdf
+*.docx
+
+# Backup and temporary files
+*~
+*.bak
+*.tmp
+
+# Note: input_images/ is NOT ignored - we want to commit sample images to the repo!
+

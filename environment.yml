@@ -1,0 +1,9 @@
+name: cst435_assign2
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - pip
+  - pip:
+      - opencv-python==4.12.0.88
