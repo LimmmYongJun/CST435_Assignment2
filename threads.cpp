@@ -1,0 +1,252 @@
+#include <filesystem>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <iostream>
+#include <chrono>
+#include <thread>
+#include <cstdlib>
+#include "src/filters.h"
+#include <fstream>
+#include <cctype>
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
+#undef STBI_NO_STDIO
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
+namespace fs = std::filesystem;
+
+struct Image
+{
+    int width = 0;
+    int height = 0;
+    std::vector<uint8_t> gray; // 8-bit grayscale
+};
+
+static bool load_grayscale_image(const std::string &path, Image &out)
+{
+    int w = 0, h = 0, ch = 0;
+    stbi_uc *data = stbi_load(path.c_str(), &w, &h, &ch, 3); // load 3-channel (BGR)
+    if (!data || w <= 0 || h <= 0)
+        return false;
+
+    out.width = w;
+    out.height = h;
+    out.gray.resize(static_cast<size_t>(w) * static_cast<size_t>(h));
+    filters::rgb_to_grayscale(reinterpret_cast<const uint8_t *>(data), out.gray.data(), w, h, /*bgr=*/true);
+    free(data);
+    return true;
+}
+
+static bool has_image_ext(const fs::path &p)
+{
+    static const std::vector<std::string> exts = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tga", ".ppm", ".pgm"};
+    std::string ext = p.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c)
+                   { return static_cast<char>(std::tolower(c)); });
+    return std::find(exts.begin(), exts.end(), ext) != exts.end();
+}
+
+static std::vector<std::string> list_image_files(const std::string &folder)
+{
+    std::vector<std::string> files;
+    try
+    {
+        for (const auto &entry : fs::directory_iterator(folder))
+        {
+            if (entry.is_regular_file() && has_image_ext(entry.path()))
+            {
+                files.push_back(entry.path().string());
+            }
+        }
+    }
+    catch (...)
+    {
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+static bool write_png(const std::string &filepath, const uint8_t *data, int w, int h)
+{
+    // write grayscale PNG; stride = w bytes
+    int ok = stbi_write_png(filepath.c_str(), w, h, 1, data, w);
+    return ok != 0;
+}
+
+static void apply_filter_rows(const std::string &filter, const uint8_t *in, uint8_t *out, int w, int h, int y0, int y1, int beta = 50)
+{
+    if (filter == "gaussian" || filter == "blur")
+    {
+        filters::gaussian_blur_rows_gray(in, out, w, h, y0, y1);
+    }
+    else if (filter == "edges" || filter == "sobel")
+    {
+        filters::sobel_rows_gray(in, out, w, h, y0, y1);
+    }
+    else if (filter == "sharpen")
+    {
+        filters::sharpen_rows_gray(in, out, w, h, y0, y1);
+    }
+    else if (filter == "brightness")
+    {
+        // Increase brightness by 50% (scale by 1.5)
+        for (int y = y0; y < y1; ++y)
+        {
+            const uint8_t *row_in = in + y * w;
+            uint8_t *row_out = out + y * w;
+            for (int x = 0; x < w; ++x)
+            {
+                int v = static_cast<int>(std::lround(row_in[x] * 1.5));
+                row_out[x] = static_cast<uint8_t>(filters::clamp(v, 0, 255));
+            }
+        }
+    }
+    else if (filter == "grayscale")
+    {
+        // Already grayscale; copy rows
+        for (int y = y0; y < y1; ++y)
+            std::copy(in + y * w, in + (y + 1) * w, out + y * w);
+    }
+    else
+    {
+        // Default to gaussian blur
+        filters::gaussian_blur_rows_gray(in, out, w, h, y0, y1);
+    }
+}
+
+static void run_filter_with_threads(const Image &img, const std::string &filter, int beta, std::vector<uint8_t> &out)
+{
+    const int w = img.width;
+    const int h = img.height;
+    out.resize(static_cast<size_t>(w) * h);
+
+    unsigned int nt = std::thread::hardware_concurrency();
+    if (nt == 0)
+        nt = 4;
+    int rows_per = (h + static_cast<int>(nt) - 1) / static_cast<int>(nt);
+
+    std::vector<std::thread> threads;
+    for (unsigned int t = 0; t < nt; ++t)
+    {
+        int y0 = static_cast<int>(t) * rows_per;
+        int y1 = std::min(h, y0 + rows_per);
+        if (y0 >= h)
+            break;
+        threads.emplace_back([&img, &out, w, h, y0, y1, &filter, beta]()
+                             { apply_filter_rows(filter, img.gray.data(), out.data(), w, h, y0, y1, beta); });
+    }
+    for (auto &th : threads)
+        th.join();
+
+    (void)out;
+}
+
+int main(int argc, char **argv)
+{
+    std::string folder = "input_images";
+    std::string filter = "all"; // default: run all 5 filters
+    int beta = 50;              // (unused for percentage brightness)
+    size_t max_images = 0;      // 0 means process all
+    if (argc > 1)
+        folder = argv[1];
+    if (argc > 2)
+    {
+        std::string a2 = argv[2];
+        bool a2_is_num = !a2.empty() && std::all_of(a2.begin(), a2.end(), [](unsigned char c)
+                                                    { return std::isdigit(c) != 0; });
+        if (a2_is_num)
+            max_images = static_cast<size_t>(std::stoull(a2));
+        else
+            filter = a2;
+    }
+    if (argc > 3)
+    {
+        std::string a3 = argv[3];
+        bool a3_is_num = !a3.empty() && std::all_of(a3.begin(), a3.end(), [](unsigned char c)
+                                                    { return std::isdigit(c) != 0; });
+        if (a3_is_num)
+            max_images = static_cast<size_t>(std::stoull(a3));
+        else
+            filter = a3;
+    }
+
+    auto files = list_image_files(folder);
+    if (files.empty())
+    {
+        std::cerr << "No images found in folder: " << folder << std::endl;
+        return 1;
+    }
+    size_t to_process = files.size();
+    if (max_images > 0 && max_images < to_process)
+        to_process = max_images;
+    std::cout << "Found " << files.size() << " image(s), processing " << to_process << "." << std::endl;
+
+    std::vector<Image> images;
+    images.reserve(files.size());
+    for (size_t i = 0; i < to_process; ++i)
+    {
+        const auto &path = files[i];
+        Image img;
+        if (load_grayscale_image(path, img))
+            images.push_back(std::move(img));
+        else
+            std::cerr << "Failed to load: " << path << std::endl;
+    }
+    if (images.empty())
+    {
+        std::cerr << "No images could be loaded." << std::endl;
+        return 1;
+    }
+
+    // If a specific filter requested, process only that; else run all
+    std::vector<std::string> filters_to_run;
+    if (filter == "all")
+    {
+        filters_to_run = {"grayscale", "gaussian", "edges", "sharpen", "brightness"};
+    }
+    else
+    {
+        filters_to_run = {filter};
+    }
+
+    uint64_t checksum_total = 0;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (const auto &filt : filters_to_run)
+    {
+        // Map folder names per requirement
+        std::string folder_name = filt;
+        if (filt == "gaussian")
+            folder_name = "gaussian_blur";
+        else if (filt == "edges")
+            folder_name = "edge_detection";
+        else if (filt == "brightness")
+            folder_name = "brightness_adjustment";
+        fs::path out_dir = fs::path("output_images") / folder_name;
+        fs::create_directories(out_dir);
+
+        std::vector<uint8_t> out;
+        for (size_t i = 0; i < images.size(); ++i)
+        {
+            run_filter_with_threads(images[i], filt, beta, out);
+            for (uint8_t v : out)
+                checksum_total += v;
+            fs::path in_path = files[i];
+            std::string stem = in_path.empty() ? ("img_" + std::to_string(i)) : fs::path(in_path).stem().string();
+            std::string fname = stem + "_" + folder_name;
+            fs::path out_path = out_dir / (fname + ".png");
+            (void)write_png(out_path.string(), out.data(), images[i].width, images[i].height);
+        }
+        std::cout << "Saved outputs to: " << out_dir.string() << std::endl;
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+
+    std::cout << "Threads checksum: " << checksum_total << std::endl;
+    std::cout << "Threads time (all filters): " << ms << " ms" << std::endl;
+
+    return 0;
+}
