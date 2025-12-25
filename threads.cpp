@@ -214,7 +214,8 @@ int main(int argc, char **argv)
     }
 
     uint64_t checksum_total = 0;
-    auto t0 = std::chrono::high_resolution_clock::now();
+    long long total_microseconds = 0;
+
     for (const auto &filt : filters_to_run)
     {
         // Map folder names per requirement
@@ -231,19 +232,28 @@ int main(int argc, char **argv)
         std::vector<uint8_t> out;
         for (size_t i = 0; i < images.size(); ++i)
         {
+            auto t_start = std::chrono::high_resolution_clock::now();
             run_filter_with_threads(images[i], filt, beta, out);
+            auto t_end = std::chrono::high_resolution_clock::now();
+            total_microseconds += std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
+
             for (uint8_t v : out)
                 checksum_total += v;
             fs::path in_path = files[i];
             std::string stem = in_path.empty() ? ("img_" + std::to_string(i)) : fs::path(in_path).stem().string();
             std::string fname = stem + "_" + folder_name;
-            fs::path out_path = out_dir / (fname + ".png");
-            (void)write_png(out_path.string(), out.data(), images[i].width, images[i].height);
+            // fs::path out_path = out_dir / (fname + ".png");
+            // (void)write_png(out_path.string(), out.data(), images[i].width, images[i].height);
         }
         std::cout << "Saved outputs to: " << out_dir.string() << std::endl;
     }
-    auto t1 = std::chrono::high_resolution_clock::now();
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+
+    auto ms = total_microseconds / 1000;
+
+    unsigned int nt = std::thread::hardware_concurrency();
+    if (nt == 0)
+        nt = 4;
+    std::cout << "Threads used: " << nt << std::endl;
 
     std::cout << "Threads checksum: " << checksum_total << std::endl;
     std::cout << "Threads time (all filters): " << ms << " ms" << std::endl;

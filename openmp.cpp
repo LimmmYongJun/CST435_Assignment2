@@ -72,8 +72,7 @@ static std::vector<std::string> list_image_files(const std::string &folder)
 
 static bool write_png(const std::string &filepath, const uint8_t *data, int w, int h)
 {
-    // Fallback: write as PGM since PNG writer is not available
-    return write_pgm(filepath, data, w, h);
+    return stbi_write_png(filepath.c_str(), w, h, 1, data, w) != 0;
 }
 
 static void run_filter_with_openmp(const Image &img, const std::string &filter, int beta, std::vector<uint8_t> &out)
@@ -197,9 +196,10 @@ int main(int argc, char **argv)
     else
         filters_to_run = {filter};
 
-    auto t0 = std::chrono::high_resolution_clock::now();
     uint64_t checksum = 0;
     std::vector<uint8_t> out;
+    long long total_microseconds = 0;
+
     for (const auto &filt : filters_to_run)
     {
         std::string folder_name = filt;
@@ -213,23 +213,28 @@ int main(int argc, char **argv)
         fs::create_directories(out_dir);
         for (size_t i = 0; i < images.size(); ++i)
         {
+            auto t_start = std::chrono::high_resolution_clock::now();
             run_filter_with_openmp(images[i], filt, beta, out);
+            auto t_end = std::chrono::high_resolution_clock::now();
+            total_microseconds += std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
+
             for (uint8_t v : out)
                 checksum += v;
             fs::path in_path = files[i];
             std::string stem = in_path.empty() ? ("img_" + std::to_string(i)) : fs::path(in_path).stem().string();
             std::string fname = stem + "_" + folder_name;
-            fs::path out_path = out_dir / (fname + ".pgm");
-            (void)write_png(out_path.string(), out.data(), images[i].width, images[i].height);
+            // fs::path out_path = out_dir / (fname + ".png");
+            // (void)write_png(out_path.string(), out.data(), images[i].width, images[i].height);
         }
         std::cout << "Saved outputs to: " << out_dir.string() << std::endl;
     }
-    auto t1 = std::chrono::high_resolution_clock::now();
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+
+    auto ms = total_microseconds / 1000;
 
     std::cout << "OpenMP enabled: "
 #ifdef _OPENMP
               << "yes" << std::endl;
+    std::cout << "OpenMP threads: " << omp_get_max_threads() << std::endl;
 #else
               << "no (compile with /openmp or -fopenmp)" << std::endl;
 #endif
