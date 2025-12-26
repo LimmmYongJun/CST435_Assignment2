@@ -26,6 +26,26 @@ struct Image
     std::vector<uint8_t> gray; // 8-bit grayscale
 };
 
+static unsigned int determine_threads()
+{
+    unsigned int nt = std::thread::hardware_concurrency();
+    if (nt == 0)
+        nt = 4;
+    if (const char *env = std::getenv("THREADS"))
+    {
+        try
+        {
+            int val = std::stoi(env);
+            if (val >= 1)
+                nt = static_cast<unsigned int>(val);
+        }
+        catch (...)
+        {
+        }
+    }
+    return nt;
+}
+
 static bool load_grayscale_image(const std::string &path, Image &out)
 {
     int w = 0, h = 0, ch = 0;
@@ -123,10 +143,7 @@ static void run_filter_with_threads(const Image &img, const std::string &filter,
     const int w = img.width;
     const int h = img.height;
     out.resize(static_cast<size_t>(w) * h);
-
-    unsigned int nt = std::thread::hardware_concurrency();
-    if (nt == 0)
-        nt = 4;
+    unsigned int nt = determine_threads();
     int rows_per = (h + static_cast<int>(nt) - 1) / static_cast<int>(nt);
 
     std::vector<std::thread> threads;
@@ -249,11 +266,7 @@ int main(int argc, char **argv)
     }
 
     auto ms = total_microseconds / 1000;
-
-    unsigned int nt = std::thread::hardware_concurrency();
-    if (nt == 0)
-        nt = 4;
-    std::cout << "Threads used: " << nt << std::endl;
+    std::cout << "Threads used: " << determine_threads() << std::endl;
 
     std::cout << "Threads checksum: " << checksum_total << std::endl;
     std::cout << "Threads time (all filters): " << ms << " ms" << std::endl;

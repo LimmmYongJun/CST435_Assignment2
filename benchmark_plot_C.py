@@ -109,7 +109,7 @@ def ensure_plots_dir(path: Path) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark threads.exe and openmp.exe vs number of images.")
+    parser = argparse.ArgumentParser(description="Benchmark threads.exe and openmp.exe vs number of images and thread counts.")
     parser.add_argument("--input-dir", default="input_images", help="Folder containing input images.")
     parser.add_argument("--start", type=int, default=50, help="Starting image count.")
     parser.add_argument("--end", type=int, default=1000, help="Ending image count (inclusive).")
@@ -119,6 +119,7 @@ def main():
     parser.add_argument("--csv", default="plots/v1_C_runtime_data.csv", help="Path to save the CSV results.")
     parser.add_argument("--save-speedup", default="plots/v1_C_speedup_vs_images.png", help="Path to save the speedup plot PNG.")
     parser.add_argument("--csv-speedup", default="plots/v1_C_speedup_data.csv", help="Path to save the speedup CSV results.")
+    parser.add_argument("--thread-counts", default="1,4,8,16", help="Comma-separated list of thread counts to test (applies to both OpenMP and threads.exe via env).")
     parser.add_argument("--skip-threads", action="store_true", help="Skip running threads.exe.")
     parser.add_argument("--skip-openmp", action="store_true", help="Skip running openmp.exe.")
     parser.add_argument("--ignore-limit", action="store_true", help="Do not cap counts by available images.")
@@ -163,7 +164,16 @@ def main():
     print(f"  Repeats:       {args.repeats}")
     print(f"  Execs:         threads={'yes' if not args.skip_threads else 'no'}, openmp={'yes' if not args.skip_openmp else 'no'}")
 
-    results = []  # list of tuples: (count, threads_ms or None, openmp_ms or None, omp1_ms or None)
+    # Parse thread counts
+    try:
+        thread_counts = [int(x.strip()) for x in args.thread_counts.split(",") if x.strip()]
+        thread_counts = [tc for tc in thread_counts if tc >= 1]
+    except Exception:
+        thread_counts = [1, 4, 8, 16]
+
+    results = []  # legacy single-run results (kept for compatibility)
+    results_threads: Dict[int, List[Tuple[int, Optional[float]]]] = {}
+    results_openmp: Dict[int, List[Tuple[int, Optional[float]]]] = {}
 
     for n in counts:
         print(f"\n=== Running n={n} ===")
@@ -172,122 +182,157 @@ def main():
         o1_ms = None
 
         if not args.skip_threads and threads_exe:
-            print("Running threads.exe...")
-            t_ms, logs = averaged_time(threads_exe, input_dir, n, args.repeats)
-            if t_ms is None:
-                print("  WARNING: Could not parse time from threads.exe output.")
-            else:
-                print(f"  threads.exe time (avg): {t_ms:.2f} ms")
+            results_threads.setdefault(n, [])
+            for tc in thread_counts:
+                print(f"Running threads.exe with THREADS={tc}...")
+                t_ms, logs = averaged_time(
+                    threads_exe,
+                    input_dir,
+                    n,
+                    args.repeats,
+                    env_override={"THREADS": str(tc)},
+                )
+                if t_ms is None:
+                    print(f"  WARNING: Could not parse time from threads.exe (THREADS={tc}) output.")
+                else:
+                    print(f"  threads.exe time (avg) @ {tc} threads: {t_ms:.2f} ms")
+                results_threads[n].append((tc, t_ms))
 
         if not args.skip_openmp and openmp_exe:
-            print("Running openmp.exe...")
-            o_ms, logs = averaged_time(openmp_exe, input_dir, n, args.repeats)
-            if o_ms is None:
-                print("  WARNING: Could not parse time from openmp.exe output.")
-            else:
-                print(f"  openmp.exe time (avg): {o_ms:.2f} ms")
-
-            print("Running openmp.exe with OMP_NUM_THREADS=1 (serial baseline)...")
-            o1_ms, _ = averaged_time(
-                openmp_exe,
-                input_dir,
-                n,
-                args.repeats,
-                env_override={"OMP_NUM_THREADS": "1"},
-            )
-            if o1_ms is None:
-                print("  WARNING: Could not parse time from openmp.exe (1 thread) output.")
-            else:
-                print(f"  openmp.exe (1 thread) time (avg): {o1_ms:.2f} ms")
+            results_openmp.setdefault(n, [])
+            for tc in thread_counts:
+                print(f"Running openmp.exe with OMP_NUM_THREADS={tc}...")
+                o_ms, logs = averaged_time(
+                    openmp_exe,
+                    input_dir,
+                    n,
+                    args.repeats,
+                    env_override={"OMP_NUM_THREADS": str(tc)},
+                )
+                if o_ms is None:
+                    print(f"  WARNING: Could not parse time from openmp.exe (OMP_NUM_THREADS={tc}) output.")
+                else:
+                    print(f"  openmp.exe time (avg) @ {tc} threads: {o_ms:.2f} ms")
+                results_openmp[n].append((tc, o_ms))
 
         results.append((n, t_ms, o_ms, o1_ms))
 
-    # Save CSV
-    csv_path = (workspace / args.csv).resolve()
-    ensure_plots_dir(csv_path)
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        f.write("count,threads_ms,openmp_ms,openmp_1thread_ms\n")
-        for n, t_ms, o_ms, o1_ms in results:
-            t_str = f"{t_ms:.4f}" if t_ms is not None else ""
-            o_str = f"{o_ms:.4f}" if o_ms is not None else ""
-            o1_str = f"{o1_ms:.4f}" if o1_ms is not None else ""
-            f.write(f"{n},{t_str},{o_str},{o1_str}\n")
-    print(f"\nSaved CSV: {csv_path}")
+    # Save CSVs for per-thread-count runs
+    csv_thr_path = (workspace / "plots/v2_C_runtime_threads_counts.csv").resolve()
+    ensure_plots_dir(csv_thr_path)
+    with open(csv_thr_path, "w", newline="", encoding="utf-8") as f:
+        header = "count," + ",".join([f"threads_{tc}_ms" for tc in thread_counts]) + "\n"
+        f.write(header)
+        for n in counts:
+            row = [str(n)]
+            vals: List[str] = []
+            entries = {tc: ms for (tc, ms) in results_threads.get(n, [])}
+            for tc in thread_counts:
+                ms = entries.get(tc)
+                vals.append(f"{float(ms):.4f}" if ms is not None else "")
+            row.extend(vals)
+            f.write(",".join(row) + "\n")
+    print(f"\nSaved threads CSV: {csv_thr_path}")
+
+    csv_omp_path = (workspace / "plots/v2_C_runtime_openmp_counts.csv").resolve()
+    ensure_plots_dir(csv_omp_path)
+    with open(csv_omp_path, "w", newline="", encoding="utf-8") as f:
+        header = "count," + ",".join([f"openmp_{tc}_ms" for tc in thread_counts]) + "\n"
+        f.write(header)
+        for n in counts:
+            row = [str(n)]
+            vals: List[str] = []
+            entries = {tc: ms for (tc, ms) in results_openmp.get(n, [])}
+            for tc in thread_counts:
+                ms = entries.get(tc)
+                vals.append(f"{float(ms):.4f}" if ms is not None else "")
+            row.extend(vals)
+            f.write(",".join(row) + "\n")
+    print(f"Saved OpenMP CSV: {csv_omp_path}")
 
     # Plot
     if plt is None:
         print("matplotlib not installed. Install with: pip install matplotlib")
         return
 
-    xs = [n for (n, _, __, ___) in results]
-    thr = [t for (_, t, __, ___) in results]
-    omp = [o for (_, _, o, ___) in results]
-    omp1 = [o1 for (_, _, __, o1) in results]
-
-    # Filter out None for plotting by masking with NaN
-    import math
-    thr_plot = [float(t) if t is not None else math.nan for t in thr]
-    omp_plot = [float(o) if o is not None else math.nan for o in omp]
-
-    plt.figure(figsize=(10, 6))
-    if not args.skip_threads:
-        plt.plot(xs, thr_plot, label="threads.exe", linewidth=2)
-    if not args.skip_openmp:
-        plt.plot(xs, omp_plot, label="openmp.exe", linewidth=2)
-
-    plt.xlabel("Images processed (n)")
-    plt.ylabel("Time (ms)")
-    plt.title("Runtime vs Number of Images")
-    plt.grid(True, linestyle="--", alpha=0.4)
-    plt.legend()
-
-    png_path = (workspace / args.save).resolve()
-    ensure_plots_dir(png_path)
-    plt.tight_layout()
-    plt.savefig(png_path, dpi=150)
-    print(f"Saved plot: {png_path}")
-
-    # Speedup plot (using OpenMP 1-thread as serial baseline)
-    if not args.skip_openmp:
-        # Compute speedups where both baseline and parallel time are present
-        speed_thr = []
-        speed_omp = []
-        for t, o, b in zip(thr, omp, omp1):
-            if b is not None and t is not None and t > 0:
-                speed_thr.append(b / t)
-            else:
-                speed_thr.append(float("nan"))
-            if b is not None and o is not None and o > 0:
-                speed_omp.append(b / o)
-            else:
-                speed_omp.append(float("nan"))
-
-        # Save speedup CSV
-        csv_speed_path = (workspace / args.csv_speedup).resolve()
-        ensure_plots_dir(csv_speed_path)
-        with open(csv_speed_path, "w", newline="", encoding="utf-8") as f:
-            f.write("count,baseline_ms,threads_speedup,openmp_speedup\n")
-            for n, b, st, so in zip(xs, omp1, speed_thr, speed_omp):
-                b_str = f"{float(b):.4f}" if b is not None else ""
-                st_str = "" if (st != st) else f"{st:.4f}"  # NaN check
-                so_str = "" if (so != so) else f"{so:.4f}"
-                f.write(f"{n},{b_str},{st_str},{so_str}\n")
-        print(f"Saved speedup CSV: {csv_speed_path}")
-
-        # Plot speedup
-        plt.figure(figsize=(10, 6))
+    # Plot: threads.exe for multiple thread counts
+    if plt is not None and not args.skip_threads:
         import math
-        sp_thr_plot = [float(s) if s == s else math.nan for s in speed_thr]
-        sp_omp_plot = [float(s) if s == s else math.nan for s in speed_omp]
-        if not args.skip_threads:
-            plt.plot(xs, sp_thr_plot, label="Speedup vs threads.exe", linewidth=2)
-        plt.plot(xs, sp_omp_plot, label="Speedup vs openmp.exe", linewidth=2)
+        plt.figure(figsize=(10, 6))
+        for tc in thread_counts:
+            ys = []
+            for n in counts:
+                entries = {t: ms for (t, ms) in results_threads.get(n, [])}
+                ms = entries.get(tc)
+                ys.append(float(ms) if ms is not None else math.nan)
+            plt.plot(counts, ys, label=f"threads.exe ({tc} threads)", linewidth=2)
         plt.xlabel("Images processed (n)")
-        plt.ylabel("Speedup (×)")
-        plt.title("Speedup vs Number of Images (baseline: OpenMP 1 thread)")
+        plt.ylabel("Time (ms)")
+        plt.title("threads.exe: Runtime vs Number of Images by thread count")
         plt.grid(True, linestyle="--", alpha=0.4)
         plt.legend()
-        png_speed_path = (workspace / args.save_speedup).resolve()
+        png_thr = (workspace / "plots/v2_C_runtime_vs_images_threads.png").resolve()
+        ensure_plots_dir(png_thr)
+        plt.tight_layout()
+        plt.savefig(png_thr, dpi=150)
+        print(f"Saved plot: {png_thr}")
+
+    # Plot: openmp.exe for multiple thread counts
+    if plt is not None and not args.skip_openmp:
+        import math
+        plt.figure(figsize=(10, 6))
+        for tc in thread_counts:
+            ys = []
+            for n in counts:
+                entries = {t: ms for (t, ms) in results_openmp.get(n, [])}
+                ms = entries.get(tc)
+                ys.append(float(ms) if ms is not None else math.nan)
+            plt.plot(counts, ys, label=f"openmp.exe ({tc} threads)", linewidth=2)
+        plt.xlabel("Images processed (n)")
+        plt.ylabel("Time (ms)")
+        plt.title("openmp.exe: Runtime vs Number of Images by thread count")
+        plt.grid(True, linestyle="--", alpha=0.4)
+        plt.legend()
+        png_omp = (workspace / "plots/v2_C_runtime_vs_images_openmp.png").resolve()
+        ensure_plots_dir(png_omp)
+        plt.tight_layout()
+        plt.savefig(png_omp, dpi=150)
+        print(f"Saved plot: {png_omp}")
+
+    # Optional: compute and save speedup vs baseline (1 thread) for each thread count
+    if plt is not None and not args.skip_openmp:
+        # Baseline from OpenMP 1 thread
+        baseline_map = {n: None for n in counts}
+        for n in counts:
+            for (tc, ms) in results_openmp.get(n, []):
+                if tc == 1:
+                    baseline_map[n] = ms
+                    break
+        # Speedup plots
+        import math
+        plt.figure(figsize=(10, 6))
+        for tc in thread_counts:
+            if tc == 1:
+                continue
+            ys = []
+            for n in counts:
+                b = baseline_map.get(n)
+                ms = None
+                for (tcc, val) in results_openmp.get(n, []):
+                    if tcc == tc:
+                        ms = val
+                        break
+                if b is not None and b > 0 and ms is not None and ms > 0:
+                    ys.append(float(b) / float(ms))
+                else:
+                    ys.append(math.nan)
+            plt.plot(counts, ys, label=f"openmp.exe speedup vs 1 thread ({tc})", linewidth=2)
+        plt.xlabel("Images processed (n)")
+        plt.ylabel("Speedup (×)")
+        plt.title("OpenMP Speedup vs 1 thread baseline")
+        plt.grid(True, linestyle="--", alpha=0.4)
+        plt.legend()
+        png_speed_path = (workspace / "plots/v2_C_speedup_openmp_vs1.png").resolve()
         ensure_plots_dir(png_speed_path)
         plt.tight_layout()
         plt.savefig(png_speed_path, dpi=150)
