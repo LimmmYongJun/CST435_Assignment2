@@ -338,6 +338,72 @@ def main():
         plt.savefig(png_speed_path, dpi=150)
         print(f"Saved speedup plot: {png_speed_path}")
 
+    # Speedup graph for threads.exe (baseline: THREADS=1)
+    if plt is not None and not args.skip_threads:
+        # Build baseline map from THREADS=1 runs
+        baseline_thr: Dict[int, Optional[float]] = {n: None for n in counts}
+        for n in counts:
+            for (tc, ms) in results_threads.get(n, []):
+                if tc == 1:
+                    baseline_thr[n] = ms
+                    break
+
+        # Save speedup CSV for threads.exe
+        csv_thr_speed_path = (workspace / "plots/v2_C_speedup_threads_vs1.csv").resolve()
+        ensure_plots_dir(csv_thr_speed_path)
+        with open(csv_thr_speed_path, "w", newline="", encoding="utf-8") as f:
+            f.write("count,baseline_ms," + ",".join([f"threads_{tc}_speedup" for tc in thread_counts if tc != 1]) + "\n")
+            for n in counts:
+                b = baseline_thr.get(n)
+                row = [str(n), (f"{float(b):.4f}" if b is not None else "")]
+                vals = []
+                for tc in thread_counts:
+                    if tc == 1:
+                        continue
+                    ms = None
+                    for (tcc, val) in results_threads.get(n, []):
+                        if tcc == tc:
+                            ms = val
+                            break
+                    if b is not None and b > 0 and ms is not None and ms > 0:
+                        vals.append(f"{float(b)/float(ms):.4f}")
+                    else:
+                        vals.append("")
+                row.extend(vals)
+                f.write(",".join(row) + "\n")
+        print(f"Saved threads speedup CSV: {csv_thr_speed_path}")
+
+        # Plot threads.exe speedup vs 1 thread baseline
+        import math
+        plt.figure(figsize=(10, 6))
+        for tc in thread_counts:
+            if tc == 1:
+                continue
+            ys = []
+            for n in counts:
+                b = baseline_thr.get(n)
+                ms = None
+                for (tcc, val) in results_threads.get(n, []):
+                    if tcc == tc:
+                        ms = val
+                        break
+                if b is not None and b > 0 and ms is not None and ms > 0:
+                    ys.append(float(b) / float(ms))
+                else:
+                    ys.append(math.nan)
+            plt.plot(counts, ys, label=f"threads.exe speedup vs 1 thread ({tc})", linewidth=2)
+        plt.xlabel("Images processed (n)")
+        plt.ylabel("Speedup (×)")
+        plt.title("threads.exe Speedup vs 1 thread baseline")
+        plt.grid(True, linestyle="--", alpha=0.4)
+        plt.legend()
+        png_thr_speed = (workspace 
+                         / "plots/v2_C_speedup_threads_vs1.png").resolve()
+        ensure_plots_dir(png_thr_speed)
+        plt.tight_layout()
+        plt.savefig(png_thr_speed, dpi=150)
+        print(f"Saved speedup plot: {png_thr_speed}")
+
     # Optionally show interactively if running locally
     if os.environ.get("SHOW_PLOT", "0") == "1":
         plt.show()
