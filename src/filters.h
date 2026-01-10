@@ -37,7 +37,7 @@ namespace filters
                     G = c1;
                     B = c2;
                 }
-                int v = static_cast<int>(0.299 * R + 0.587 * G + 0.114 * B + 0.5);
+                int v = static_cast<int>(0.2126 * R + 0.7152 * G + 0.0722 * B + 0.5);
                 gout[x] = static_cast<uint8_t>(clamp(v, 0, 255));
             }
         }
