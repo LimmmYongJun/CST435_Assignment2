@@ -11,6 +11,9 @@ threads.exe
 
 # Output images (processed results - do not track)
 output_images/
+plots_correct/
+plots_old/
+plots_v1/
 
 # Python cache files
 __pycache__/
