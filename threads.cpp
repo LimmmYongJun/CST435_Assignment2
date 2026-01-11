@@ -1,275 +1,437 @@
-#include <filesystem>
+#include <iostream>
 #include <vector>
 #include <string>
 #include <algorithm>
-#include <iostream>
+#include <filesystem>
 #include <chrono>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <cstdlib>
+#include <cctype>
+#include <cstring>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "third_party/stb/stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "third_party/stb/stb_image_write.h"
 #include "src/filters.h"
 #include <fstream>
-#include <cctype>
 
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
-
-#undef STBI_NO_STDIO
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
-
+// Use a namespace for file system to handle different C++ versions/compilers
 namespace fs = std::filesystem;
+
+// -------------------------------------------------------------------------
+// Structures
+// -------------------------------------------------------------------------
+
+struct PipelineTimings
+{
+    long long grayscale_us = 0;
+    long long gaussian_us = 0;
+    long long edges_us = 0;
+    long long sharpen_us = 0;
+    long long brightness_us = 0;
+};
+
+// Simple Barrier for C++17
+class Barrier {
+public:
+    explicit Barrier(std::size_t count) : threshold_(count), count_(count), generation_(0) {}
+
+    void wait() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        auto gen = generation_;
+        if (--count_ == 0) {
+            generation_++;
+            count_ = threshold_;
+            cond_.notify_all();
+        } else {
+            cond_.wait(lock, [this, gen] { return gen != generation_; });
+        }
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cond_;
+    std::size_t threshold_;
+    std::size_t count_;
+    std::size_t generation_;
+};
+
+struct SharedBuffers
+{
+    std::vector<uint8_t> gray;
+    std::vector<uint8_t> blur;
+    std::vector<uint8_t> edges;
+    std::vector<uint8_t> sharp;
+    std::vector<uint8_t> brightness;
+    std::vector<uint8_t> final_out;
+    std::vector<PipelineTimings> thread_times;
+
+    void resize(size_t num_pixels, size_t num_threads) {
+        if (gray.size() != num_pixels) {
+            gray.resize(num_pixels);
+            blur.resize(num_pixels);
+            edges.resize(num_pixels);
+            sharp.resize(num_pixels);
+            brightness.resize(num_pixels);
+            final_out.resize(num_pixels);
+        }
+        if (thread_times.size() != num_threads) {
+            thread_times.resize(num_threads);
+        }
+        // Reset timings
+        for(auto &t : thread_times) t = {};
+    }
+};
 
 struct Image
 {
     int width = 0;
     int height = 0;
-    std::vector<uint8_t> gray; // 8-bit grayscale
+    int channels = 0;
+    std::vector<uint8_t> rgb;
 };
 
+// -------------------------------------------------------------------------
+// Helper Functions
+// -------------------------------------------------------------------------
+
+// Helper to determine thread count
 static unsigned int determine_threads()
 {
-    unsigned int nt = std::thread::hardware_concurrency();
-    if (nt == 0)
-        nt = 4;
-    if (const char *env = std::getenv("THREADS"))
+    // Check environment variable first
+    const char* env_threads = std::getenv("THREADS");
+    if (env_threads)
     {
-        try
-        {
-            int val = std::stoi(env);
-            if (val >= 1)
-                nt = static_cast<unsigned int>(val);
-        }
-        catch (...)
-        {
-        }
+        try {
+            int val = std::stoi(env_threads);
+            if (val > 0) return static_cast<unsigned int>(val);
+        } catch (...) {}
     }
-    return nt;
+    // Fallback to hardware concurrency or 4
+    unsigned int n = std::thread::hardware_concurrency();
+    return (n == 0) ? 4 : n;
 }
 
-static bool load_grayscale_image(const std::string &path, Image &out)
+static bool load_image(const fs::path &path, Image &img)
 {
-    int w = 0, h = 0, ch = 0;
-    stbi_uc *data = stbi_load(path.c_str(), &w, &h, &ch, 3); // load 3-channel (BGR)
-    if (!data || w <= 0 || h <= 0)
-        return false;
-
-    out.width = w;
-    out.height = h;
-    out.gray.resize(static_cast<size_t>(w) * static_cast<size_t>(h));
-    filters::rgb_to_grayscale(reinterpret_cast<const uint8_t *>(data), out.gray.data(), w, h, /*bgr=*/true);
-    free(data);
+    int w, h, c;
+    unsigned char *data = stbi_load(path.string().c_str(), &w, &h, &c, 3);
+    if (!data) return false;
+    img.width = w;
+    img.height = h;
+    img.channels = 3;
+    img.rgb.assign(data, data + w * h * 3);
+    stbi_image_free(data);
     return true;
 }
 
-static bool has_image_ext(const fs::path &p)
+static bool write_jpg(const std::string &filename, const uint8_t *data, int w, int h)
 {
-    static const std::vector<std::string> exts = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tga", ".ppm", ".pgm"};
-    std::string ext = p.extension().string();
-    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c)
-                   { return static_cast<char>(std::tolower(c)); });
-    return std::find(exts.begin(), exts.end(), ext) != exts.end();
+    int ok = stbi_write_jpg(filename.c_str(), w, h, 1, data, 90);
+    return ok != 0;
 }
 
-static std::vector<std::string> list_image_files(const std::string &folder)
+static std::vector<fs::path> list_image_files(const std::string &folder)
 {
-    std::vector<std::string> files;
-    try
+    std::vector<fs::path> files;
+    if (!fs::exists(folder) || !fs::is_directory(folder))
+        return files;
+
+    for (const auto &entry : fs::directory_iterator(folder))
     {
-        for (const auto &entry : fs::directory_iterator(folder))
+        if (entry.is_regular_file())
         {
-            if (entry.is_regular_file() && has_image_ext(entry.path()))
+            auto ext = entry.path().extension().string();
+            // Basic check for jpg/png/bmp
+            std::string ext_lower = ext;
+            std::transform(ext_lower.begin(), ext_lower.end(), ext_lower.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+            
+            if (ext_lower == ".jpg" || ext_lower == ".jpeg" || ext_lower == ".png" || ext_lower == ".bmp")
             {
-                files.push_back(entry.path().string());
+                files.push_back(entry.path());
             }
         }
     }
-    catch (...)
-    {
-    }
+    // Sort to ensure deterministic order
     std::sort(files.begin(), files.end());
     return files;
 }
 
-static bool write_png(const std::string &filepath, const uint8_t *data, int w, int h)
+// -------------------------------------------------------------------------
+// Core Pipeline
+// -------------------------------------------------------------------------
+
+// Helper to apply all filters on a range of rows
+static void apply_pipeline_rows(const Image &img, 
+                                SharedBuffers &bufs,
+                                int w, int h, int y0, int y1, float gamma,
+                                PipelineTimings &t_local,
+                                Barrier &barrier)
 {
-    // write grayscale PNG; stride = w bytes
-    int ok = stbi_write_png(filepath.c_str(), w, h, 1, data, w);
-    return ok != 0;
+    // 1. Grayscale
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int y = y0; y < y1; ++y)
+        filters::rgb_to_grayscale_row(img.rgb.data() + y*w*3, bufs.gray.data() + y*w, w, /*bgr=*/false);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    t_local.grayscale_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+    // Barrier: Wait for everyone to finish Grayscale
+    barrier.wait();
+
+    // 2. Gaussian
+    t0 = std::chrono::high_resolution_clock::now();
+    filters::gaussian_blur_rows_gray(bufs.gray.data(), bufs.blur.data(), w, h, y0, y1);
+    t1 = std::chrono::high_resolution_clock::now();
+    t_local.gaussian_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+    // Barrier: Wait for everyone to finish Gaussian
+    barrier.wait();
+
+    // 3. Edges
+    t0 = std::chrono::high_resolution_clock::now();
+    filters::sobel_rows_gray(bufs.blur.data(), bufs.edges.data(), w, h, y0, y1);
+    t1 = std::chrono::high_resolution_clock::now();
+    t_local.edges_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+    // Barrier: Wait for everyone to finish Edges
+    barrier.wait();
+
+    // 4. Sharpen
+    t0 = std::chrono::high_resolution_clock::now();
+    filters::sharpen_rows_gray(bufs.edges.data(), bufs.sharp.data(), w, h, y0, y1);
+    t1 = std::chrono::high_resolution_clock::now();
+    t_local.sharpen_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+    // Barrier: Wait for everyone to finish Sharpen
+    barrier.wait();
+
+    // 5. Brightness
+    t0 = std::chrono::high_resolution_clock::now();
+    filters::brightness_rows_gray(bufs.sharp.data(), bufs.brightness.data(), w, h, y0, y1, gamma);
+    t1 = std::chrono::high_resolution_clock::now();
+    t_local.brightness_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
 }
 
-static void apply_filter_rows(const std::string &filter, const uint8_t *in, uint8_t *out, int w, int h, int y0, int y1, int beta = 50)
-{
-    if (filter == "gaussian" || filter == "blur")
-    {
-        filters::gaussian_blur_rows_gray(in, out, w, h, y0, y1);
-    }
-    else if (filter == "edges" || filter == "sobel")
-    {
-        filters::sobel_rows_gray(in, out, w, h, y0, y1);
-    }
-    else if (filter == "sharpen")
-    {
-        filters::sharpen_rows_gray(in, out, w, h, y0, y1);
-    }
-    else if (filter == "brightness")
-    {
-        // Increase brightness by 50% (scale by 1.5)
-        for (int y = y0; y < y1; ++y)
+// -------------------------------------------------------------------------
+// Main
+// -------------------------------------------------------------------------
+
+// --- Global Sync Variables ---
+std::mutex mtx_job;
+std::condition_variable cv_job;
+int global_job_id = 0; // Monotonic counter to prevent races
+bool time_to_quit = false;
+
+// Sync for Master to know when image is done
+std::mutex mtx_done;
+std::condition_variable cv_done;
+int threads_completed_count = 0;
+
+// Global pointers for current job context
+const Image* current_img_ptr = nullptr;
+SharedBuffers* current_bufs_ptr = nullptr;
+float current_gamma = 1.0f;
+
+// Worker Function
+void worker_thread_func(int thread_id, int num_threads, Barrier& stage_barrier) {
+    int last_job_id = 0;
+    while (true) {
+        // 1. Wait for New Job
         {
-            const uint8_t *row_in = in + y * w;
-            uint8_t *row_out = out + y * w;
-            for (int x = 0; x < w; ++x)
-            {
-                int v = static_cast<int>(std::lround(row_in[x] * 1.5));
-                row_out[x] = static_cast<uint8_t>(filters::clamp(v, 0, 255));
+            std::unique_lock<std::mutex> lock(mtx_job);
+            cv_job.wait(lock, [&] { return global_job_id > last_job_id || time_to_quit; });
+            if (time_to_quit) return;
+            last_job_id = global_job_id;
+        }
+
+        // 2. Setup Work
+        int w = current_img_ptr->width;
+        int h = current_img_ptr->height;
+        int rows_per = (h + num_threads - 1) / num_threads;
+        int y0 = thread_id * rows_per;
+        int y1 = std::min(h, y0 + rows_per);
+
+        // 3. Run Pipeline 
+        if (y0 < h) {
+             apply_pipeline_rows(*current_img_ptr, *current_bufs_ptr, 
+                                w, h, y0, y1, current_gamma, 
+                                current_bufs_ptr->thread_times[thread_id], stage_barrier);
+        } else {
+             // Inactive threads still need to hit barriers to let active peers proceed
+             for(int k=0; k<5; ++k) stage_barrier.wait();
+        }
+
+        // 4. Report "I am done"
+        {
+            std::lock_guard<std::mutex> lk(mtx_done);
+            threads_completed_count++;
+            if (threads_completed_count == num_threads) {
+                cv_done.notify_one(); // Wake up Master
             }
         }
+        
+        // 5. Wait for loop synchronization 
+        // Sync with peers before checking for next job
+        stage_barrier.wait(); 
     }
-    else if (filter == "grayscale")
-    {
-        // Already grayscale; copy rows
-        for (int y = y0; y < y1; ++y)
-            std::copy(in + y * w, in + (y + 1) * w, out + y * w);
-    }
-    else
-    {
-        // Default to gaussian blur
-        filters::gaussian_blur_rows_gray(in, out, w, h, y0, y1);
-    }
-}
-
-static void run_filter_with_threads(const Image &img, const std::string &filter, int beta, std::vector<uint8_t> &out)
-{
-    const int w = img.width;
-    const int h = img.height;
-    out.resize(static_cast<size_t>(w) * h);
-    unsigned int nt = determine_threads();
-    int rows_per = (h + static_cast<int>(nt) - 1) / static_cast<int>(nt);
-
-    std::vector<std::thread> threads;
-    for (unsigned int t = 0; t < nt; ++t)
-    {
-        int y0 = static_cast<int>(t) * rows_per;
-        int y1 = std::min(h, y0 + rows_per);
-        if (y0 >= h)
-            break;
-        threads.emplace_back([&img, &out, w, h, y0, y1, &filter, beta]()
-                             { apply_filter_rows(filter, img.gray.data(), out.data(), w, h, y0, y1, beta); });
-    }
-    for (auto &th : threads)
-        th.join();
-
-    (void)out;
 }
 
 int main(int argc, char **argv)
 {
     std::string folder = "input_images";
-    std::string filter = "all"; // default: run all 5 filters
-    int beta = 50;              // (unused for percentage brightness)
-    size_t max_images = 0;      // 0 means process all
-    if (argc > 1)
-        folder = argv[1];
+    std::string filter = "all"; 
+    float gamma = 0.9f; 
+    size_t max_images = 0;
+    if (argc > 1) folder = argv[1];
     if (argc > 2)
     {
         std::string a2 = argv[2];
-        bool a2_is_num = !a2.empty() && std::all_of(a2.begin(), a2.end(), [](unsigned char c)
-                                                    { return std::isdigit(c) != 0; });
-        if (a2_is_num)
-            max_images = static_cast<size_t>(std::stoull(a2));
-        else
-            filter = a2;
+        bool a2_is_num = !a2.empty() && std::all_of(a2.begin(), a2.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
+        if (a2_is_num) max_images = static_cast<size_t>(std::stoull(a2));
+        else filter = a2;
     }
     if (argc > 3)
     {
         std::string a3 = argv[3];
-        bool a3_is_num = !a3.empty() && std::all_of(a3.begin(), a3.end(), [](unsigned char c)
-                                                    { return std::isdigit(c) != 0; });
-        if (a3_is_num)
-            max_images = static_cast<size_t>(std::stoull(a3));
-        else
-            filter = a3;
+        bool a3_is_num = !a3.empty() && std::all_of(a3.begin(), a3.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
+        if (a3_is_num) max_images = static_cast<size_t>(std::stoull(a3));
+        else filter = a3;
     }
 
     auto files = list_image_files(folder);
-    if (files.empty())
-    {
+    if (files.empty()) {
         std::cerr << "No images found in folder: " << folder << std::endl;
         return 1;
     }
     size_t to_process = files.size();
-    if (max_images > 0 && max_images < to_process)
-        to_process = max_images;
+    if (max_images > 0 && max_images < to_process) to_process = max_images;
     std::cout << "Found " << files.size() << " image(s), processing " << to_process << "." << std::endl;
 
     std::vector<Image> images;
     images.reserve(files.size());
-    for (size_t i = 0; i < to_process; ++i)
-    {
+    for (size_t i = 0; i < to_process; ++i) {
         const auto &path = files[i];
         Image img;
-        if (load_grayscale_image(path, img))
-            images.push_back(std::move(img));
-        else
-            std::cerr << "Failed to load: " << path << std::endl;
+        if (load_image(path, img)) images.push_back(std::move(img));
+        else std::cerr << "Failed to load: " << path << std::endl;
     }
-    if (images.empty())
-    {
+    if (images.empty()) {
         std::cerr << "No images could be loaded." << std::endl;
         return 1;
     }
 
-    // If a specific filter requested, process only that; else run all
+    // Determine threads
+    unsigned int nt = determine_threads();
+    std::cout << "Threads used: " << nt << std::endl;
+
+    // Initialize Barrier for WORKERS ONLY
+    Barrier stage_barrier(nt);
+    SharedBuffers bufs;
+    std::vector<std::thread> threads;
+    
+    // Launch Persistent Threads
+    for (unsigned int t = 0; t < nt; ++t) {
+        threads.emplace_back(worker_thread_func, t, nt, std::ref(stage_barrier));
+    }
+
+    uint64_t checksum = 0;
+    PipelineTimings total_times{};
+    
+    std::string out_subdir = (filter == "all") ? "pipeline_final" : filter;
+    fs::path out_dir = fs::path("output_images") / out_subdir;
+    fs::create_directories(out_dir);
+
+    // Filter list
     std::vector<std::string> filters_to_run;
-    if (filter == "all")
-    {
-        filters_to_run = {"grayscale", "gaussian", "edges", "sharpen", "brightness"};
-    }
-    else
-    {
-        filters_to_run = {filter};
-    }
+    if (filter == "all") filters_to_run = {"grayscale", "gaussian", "edges", "sharpen", "brightness"};
+    else filters_to_run = {filter};
 
-    uint64_t checksum_total = 0;
-    long long total_microseconds = 0;
+    // Master Loop
+    for (size_t i = 0; i < images.size(); ++i) {
+        const auto &img = images[i];
+        
+        // 1. Prepare Shared State
+        current_img_ptr = &img;
+        current_bufs_ptr = &bufs;
+        current_gamma = gamma;
+        
+        // Resize buffers (Serial, safe because workers are waiting)
+        bufs.resize(static_cast<size_t>(img.width) * img.height, nt);
 
-    for (const auto &filt : filters_to_run)
-    {
-        // Map folder names per requirement
-        std::string folder_name = filt;
-        if (filt == "gaussian")
-            folder_name = "gaussian_blur";
-        else if (filt == "edges")
-            folder_name = "edge_detection";
-        else if (filt == "brightness")
-            folder_name = "brightness_adjustment";
-        fs::path out_dir = fs::path("output_images") / folder_name;
-        fs::create_directories(out_dir);
-
-        std::vector<uint8_t> out;
-        for (size_t i = 0; i < images.size(); ++i)
+        // 2. Reset Counter
         {
-            auto t_start = std::chrono::high_resolution_clock::now();
-            run_filter_with_threads(images[i], filt, beta, out);
-            auto t_end = std::chrono::high_resolution_clock::now();
-            total_microseconds += std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
-
-            for (uint8_t v : out)
-                checksum_total += v;
-            fs::path in_path = files[i];
-            std::string stem = in_path.empty() ? ("img_" + std::to_string(i)) : fs::path(in_path).stem().string();
-            std::string fname = stem + "_" + folder_name;
-            // fs::path out_path = out_dir / (fname + ".png");
-            // (void)write_png(out_path.string(), out.data(), images[i].width, images[i].height);
+            std::lock_guard<std::mutex> lk(mtx_done);
+            threads_completed_count = 0;
         }
-        std::cout << "Saved outputs to: " << out_dir.string() << std::endl;
+
+        // 3. Wake Workers
+        {
+            std::lock_guard<std::mutex> lk(mtx_job);
+            global_job_id++;
+        }
+        cv_job.notify_all();
+
+        // 4. Wait for Completion
+        {
+            std::unique_lock<std::mutex> lk(mtx_done);
+            cv_done.wait(lk, [&]{ return threads_completed_count == (int)nt; });
+        }
+
+        // 5. Workers are looping back to wait for next job_id increment
+        // No manual reset needed for job_id
+        
+        // 6. Aggregate Results
+        PipelineTimings img_times{};
+        for(const auto &loc : bufs.thread_times) {
+                if(loc.grayscale_us > img_times.grayscale_us) img_times.grayscale_us = loc.grayscale_us;
+                if(loc.gaussian_us > img_times.gaussian_us) img_times.gaussian_us = loc.gaussian_us;
+                if(loc.edges_us > img_times.edges_us) img_times.edges_us = loc.edges_us;
+                if(loc.sharpen_us > img_times.sharpen_us) img_times.sharpen_us = loc.sharpen_us;
+                if(loc.brightness_us > img_times.brightness_us) img_times.brightness_us = loc.brightness_us;
+        }
+        total_times.grayscale_us += img_times.grayscale_us;
+        total_times.gaussian_us += img_times.gaussian_us;
+        total_times.edges_us += img_times.edges_us;
+        total_times.sharpen_us += img_times.sharpen_us;
+        total_times.brightness_us += img_times.brightness_us;
+
+        // Checksum & Write
+        if (filter == "grayscale") bufs.final_out = bufs.gray;
+        else if (filter == "gaussian") bufs.final_out = bufs.blur;
+        else if (filter == "edges") bufs.final_out = bufs.edges;
+        else if (filter == "sharpen") bufs.final_out = bufs.sharp;
+        else bufs.final_out = bufs.brightness; 
+
+        for (uint8_t v : bufs.final_out) checksum += v;
+
+        fs::path in_path = files[i];
+        std::string stem = in_path.empty() ? ("img_" + std::to_string(i)) : fs::path(in_path).stem().string();
+        std::string fname = stem + "_" + out_subdir + ".jpg";
+        fs::path out_path = out_dir / fname;
+        (void)write_jpg(out_path.string(), bufs.final_out.data(), img.width, img.height);
     }
 
-    auto ms = total_microseconds / 1000;
-    std::cout << "Threads used: " << determine_threads() << std::endl;
+    // Shutdown
+    {
+        std::lock_guard<std::mutex> lk(mtx_job);
+        time_to_quit = true;
+    }
+    cv_job.notify_all();
+    for (auto &th : threads) th.join();
 
-    std::cout << "Threads checksum: " << checksum_total << std::endl;
-    std::cout << "Threads time (all filters): " << ms << " ms" << std::endl;
+    std::cout << "Threads checksum: " << checksum << std::endl;
+    long long total_us_all = total_times.grayscale_us + total_times.gaussian_us + total_times.edges_us + total_times.sharpen_us + total_times.brightness_us;
+    auto ms = total_us_all / 1000;
+    
+    if (filter == "all") std::cout << "Threads time (all filters): " << ms << " ms" << std::endl;
+    if (filter == "grayscale") std::cout << "Threads time (grayscale): " << ms << " ms" << std::endl;
+    if (filter == "gaussian") std::cout << "Threads time (gaussian): " << ms << " ms" << std::endl;
+    if (filter == "edges") std::cout << "Threads time (edges): " << ms << " ms" << std::endl;
+    if (filter == "sharpen") std::cout << "Threads time (sharpen): " << ms << " ms" << std::endl;
+    if (filter == "brightness") std::cout << "Threads time (brightness): " << ms << " ms" << std::endl;
 
     return 0;
 }

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <cctype>
+#include <cstring>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -14,7 +15,7 @@
 
 #undef STBI_NO_STDIO
 #define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
+#include "third_party/stb/stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "third_party/stb/stb_image_write.h"
 #include "src/filters.h"
@@ -24,10 +25,42 @@ struct Image
 {
     int width = 0;
     int height = 0;
-    std::vector<uint8_t> gray; // 8-bit grayscale
+    std::vector<uint8_t> rgb; // 3-channel RGB
 };
 
-static bool load_grayscale_image(const std::string &path, Image &out)
+struct PipelineTimings
+{
+    long long grayscale_us = 0;
+    long long gaussian_us = 0;
+    long long edges_us = 0;
+    long long sharpen_us = 0;
+    long long brightness_us = 0;
+};
+
+// Reusable buffers to avoid repeated allocation
+struct SharedBuffers
+{
+    std::vector<uint8_t> gray;
+    std::vector<uint8_t> blur;
+    std::vector<uint8_t> edges;
+    std::vector<uint8_t> sharp;
+    std::vector<uint8_t> brightness;
+    std::vector<uint8_t> final_out;
+    PipelineTimings current_times;
+    
+    // Helper to resizing all buffers to match the current image size
+    void resize(size_t num_pixels)
+    {
+        if (gray.size() != num_pixels) gray.resize(num_pixels);
+        if (blur.size() != num_pixels) blur.resize(num_pixels);
+        if (edges.size() != num_pixels) edges.resize(num_pixels);
+        if (sharp.size() != num_pixels) sharp.resize(num_pixels);
+        if (brightness.size() != num_pixels) brightness.resize(num_pixels);
+        if (final_out.size() != num_pixels) final_out.resize(num_pixels);
+    }
+};
+
+static bool load_image(const std::string &path, Image &out)
 {
     int w = 0, h = 0, ch = 0;
     stbi_uc *data = stbi_load(path.c_str(), &w, &h, &ch, 3); // load 3-channel
@@ -35,8 +68,9 @@ static bool load_grayscale_image(const std::string &path, Image &out)
         return false;
     out.width = w;
     out.height = h;
-    out.gray.resize(static_cast<size_t>(w) * static_cast<size_t>(h));
-    filters::rgb_to_grayscale(reinterpret_cast<const uint8_t *>(data), out.gray.data(), w, h, /*bgr=*/false);
+    size_t num_pixels = static_cast<size_t>(w) * static_cast<size_t>(h);
+    out.rgb.resize(num_pixels * 3);
+    std::memcpy(out.rgb.data(), data, num_pixels * 3);
     stbi_image_free(data);
     return true;
 }
@@ -70,73 +104,108 @@ static std::vector<std::string> list_image_files(const std::string &folder)
     return files;
 }
 
-static bool write_png(const std::string &filepath, const uint8_t *data, int w, int h)
+static bool write_jpg(const std::string &filepath, const uint8_t *data, int w, int h)
 {
-    return stbi_write_png(filepath.c_str(), w, h, 1, data, w) != 0;
+    return stbi_write_jpg(filepath.c_str(), w, h, 1, data, 100) != 0;
 }
 
-static void run_filter_with_openmp(const Image &img, const std::string &filter, int beta, std::vector<uint8_t> &out)
+// NOTE: This function must be called from WITHIN a parallel region.
+static void run_pipeline_with_openmp(const Image &img, float gamma, SharedBuffers &bufs, 
+                                     std::vector<uint8_t> &final_out, const std::string &return_stage,
+                                     PipelineTimings &times)
 {
-    const int w = img.width;
-    const int h = img.height;
-    out.resize(static_cast<size_t>(w) * h);
+    int w = img.width;
+    int h = img.height;
+    
+    // Local timers for the master thread
+    std::chrono::high_resolution_clock::time_point t0, t1;
 
-    auto clamp = [](int v, int lo, int hi)
-    { return v < lo ? lo : (v > hi ? hi : v); };
+    // 1. Grayscale
+    // Only Master records start time (very cheap)
+    if (omp_get_thread_num() == 0) t0 = std::chrono::high_resolution_clock::now();
 
-    if (filter == "gaussian" || filter == "blur")
-    {
-#pragma omp parallel for schedule(static)
-        for (int y = 0; y < h; ++y)
-            filters::gaussian_blur_row_gray(img.gray.data(), out.data(), w, h, y);
-    }
-    else if (filter == "edges" || filter == "sobel")
-    {
-#pragma omp parallel for schedule(static)
-        for (int y = 0; y < h; ++y)
-            filters::sobel_row_gray(img.gray.data(), out.data(), w, h, y);
-    }
-    else if (filter == "sharpen")
-    {
-#pragma omp parallel for schedule(static)
-        for (int y = 0; y < h; ++y)
-            filters::sharpen_row_gray(img.gray.data(), out.data(), w, h, y);
-    }
-    else if (filter == "brightness")
-    {
-#pragma omp parallel for schedule(static)
-        for (int y = 0; y < h; ++y)
-        {
-            const uint8_t *row_in = img.gray.data() + y * w;
-            uint8_t *row_out = out.data() + y * w;
-            for (int x = 0; x < w; ++x)
-            {
-                int v = static_cast<int>(std::lround(row_in[x] * 1.5));
-                row_out[x] = static_cast<uint8_t>(filters::clamp(v, 0, 255));
-            }
-        }
-    }
-    else if (filter == "grayscale")
-    {
-#pragma omp parallel for schedule(static)
-        for (int y = 0; y < h; ++y)
-            std::copy(img.gray.data() + y * w, img.gray.data() + (y + 1) * w, out.data() + y * w);
-    }
-    else
-    {
-#pragma omp parallel for schedule(static)
-        for (int y = 0; y < h; ++y)
-            filters::gaussian_blur_row_gray(img.gray.data(), out.data(), w, h, y);
+    // The WORK (nowait allows threads to finish without waiting for laggards immediately)
+    #pragma omp for schedule(static) nowait
+    for(int y=0; y<h; ++y) 
+        filters::rgb_to_grayscale_row(img.rgb.data() + y*w*3, bufs.gray.data() + y*w, w, /*bgr=*/false);
+    
+    // Only Master records end time immediately (Pure Math Time)
+    if (omp_get_thread_num() == 0) {
+        t1 = std::chrono::high_resolution_clock::now();
+        times.grayscale_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        t0 = std::chrono::high_resolution_clock::now(); // Start clock for next stage
     }
 
-    (void)out;
+    // Explicit barrier to sync before next stage
+    #pragma omp barrier
+
+    // 2. Gaussian
+    if (omp_get_thread_num() == 0) t0 = std::chrono::high_resolution_clock::now(); // Restart clock after barrier
+    #pragma omp for schedule(static) nowait
+    for(int y=0; y<h; ++y)
+        filters::gaussian_blur_row_gray(bufs.gray.data(), bufs.blur.data(), w, h, y);
+
+    if (omp_get_thread_num() == 0) {
+        t1 = std::chrono::high_resolution_clock::now();
+        times.gaussian_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        t0 = std::chrono::high_resolution_clock::now();
+    }
+    #pragma omp barrier
+
+    // 3. Edges
+    if (omp_get_thread_num() == 0) t0 = std::chrono::high_resolution_clock::now();
+    #pragma omp for schedule(static) nowait
+    for(int y=0; y<h; ++y)
+        filters::sobel_row_gray(bufs.blur.data(), bufs.edges.data(), w, h, y);
+
+    if (omp_get_thread_num() == 0) {
+        t1 = std::chrono::high_resolution_clock::now();
+        times.edges_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        t0 = std::chrono::high_resolution_clock::now();
+    }
+    #pragma omp barrier
+
+    // 4. Sharpen
+    if (omp_get_thread_num() == 0) t0 = std::chrono::high_resolution_clock::now();
+    #pragma omp for schedule(static) nowait
+    for(int y=0; y<h; ++y)
+        filters::sharpen_row_gray(bufs.edges.data(), bufs.sharp.data(), w, h, y);
+
+    if (omp_get_thread_num() == 0) {
+        t1 = std::chrono::high_resolution_clock::now();
+        times.sharpen_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        t0 = std::chrono::high_resolution_clock::now();
+    }
+    #pragma omp barrier
+
+    // 5. Brightness
+    if (omp_get_thread_num() == 0) t0 = std::chrono::high_resolution_clock::now();
+    #pragma omp for schedule(static) nowait
+    for(int y=0; y<h; ++y)
+        filters::brightness_row_gray(bufs.sharp.data(), bufs.brightness.data(), w, h, y, gamma);
+
+    if (omp_get_thread_num() == 0) {
+        t1 = std::chrono::high_resolution_clock::now();
+        times.brightness_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    }
+    #pragma omp barrier
+
+    // Copy to final output (Only master needs to do this logic)
+    #pragma omp single
+    {
+        if (return_stage == "grayscale") final_out = bufs.gray;
+        else if (return_stage == "gaussian") final_out = bufs.blur;
+        else if (return_stage == "edges") final_out = bufs.edges;
+        else if (return_stage == "sharpen") final_out = bufs.sharp;
+        else final_out = bufs.brightness; 
+    }
 }
 
 int main(int argc, char **argv)
 {
     std::string folder = "input_images";
     std::string filter = "all";
-    int beta = 50;
+    float gamma = 0.9f;
     size_t max_images = 0; // 0 means process all
     if (argc > 1)
         folder = argv[1];
@@ -178,7 +247,7 @@ int main(int argc, char **argv)
     {
         const auto &path = files[i];
         Image img;
-        if (load_grayscale_image(path, img))
+        if (load_image(path, img))
             images.push_back(std::move(img));
         else
             std::cerr << "Failed to load: " << path << std::endl;
@@ -197,49 +266,80 @@ int main(int argc, char **argv)
         filters_to_run = {filter};
 
     uint64_t checksum = 0;
-    std::vector<uint8_t> out;
-    long long total_microseconds = 0;
+    long long total_us = 0;
+    
+    // Create output directory for the specific filter
+    std::string out_subdir = (filter == "all") ? "pipeline_final" : filter;
+    fs::path out_dir = fs::path("output_images") / out_subdir;
+    fs::create_directories(out_dir);
 
-    for (const auto &filt : filters_to_run)
+    // Prepare shared resources
+    SharedBuffers bufs;
+
+    // --- PARALLEL REGION STARTS HERE ---
+    // The thread team is created ONCE and reused for all images.
+    #pragma omp parallel
     {
-        std::string folder_name = filt;
-        if (filt == "gaussian")
-            folder_name = "gaussian_blur";
-        else if (filt == "edges")
-            folder_name = "edge_detection";
-        else if (filt == "brightness")
-            folder_name = "brightness_adjustment";
-        fs::path out_dir = fs::path("output_images") / folder_name;
-        fs::create_directories(out_dir);
         for (size_t i = 0; i < images.size(); ++i)
         {
-            auto t_start = std::chrono::high_resolution_clock::now();
-            run_filter_with_openmp(images[i], filt, beta, out);
-            auto t_end = std::chrono::high_resolution_clock::now();
-            total_microseconds += std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
+            const auto &img = images[i];
+            size_t num_pixels = static_cast<size_t>(img.width) * img.height;
 
-            for (uint8_t v : out)
-                checksum += v;
-            fs::path in_path = files[i];
-            std::string stem = in_path.empty() ? ("img_" + std::to_string(i)) : fs::path(in_path).stem().string();
-            std::string fname = stem + "_" + folder_name;
-            // fs::path out_path = out_dir / (fname + ".png");
-            // (void)write_png(out_path.string(), out.data(), images[i].width, images[i].height);
+            // 1. Resize buffers if needed (only one thread needs to do this)
+            #pragma omp single
+            {
+                bufs.resize(num_pixels);
+                // Reset timings for this image
+                bufs.current_times = PipelineTimings{};
+            }
+            // Barrier implied by omp single? Yes. But keep safe.
+            
+            // Run pipeline
+            run_pipeline_with_openmp(img, gamma, bufs, bufs.final_out, filter, bufs.current_times);
+
+            // Accumulate timings and write (Master only)
+            #pragma omp single
+            {
+                // Add to total
+                 for (const auto &filt : filters_to_run) {
+                    long long val = 0;
+                    if(filt == "grayscale") val = bufs.current_times.grayscale_us;
+                    else if(filt == "gaussian") val = bufs.current_times.gaussian_us;
+                    else if(filt == "edges") val = bufs.current_times.edges_us;
+                    else if(filt == "sharpen") val = bufs.current_times.sharpen_us;
+                    else if(filt == "brightness") val = bufs.current_times.brightness_us;
+                    total_us += val;
+                }
+                
+                // Checksum
+                for (uint8_t v : bufs.final_out) checksum += v;
+
+                // Write
+                fs::path in_path = files[i];
+                std::string stem = in_path.empty() ? ("img_" + std::to_string(i)) : fs::path(in_path).stem().string();
+                std::string fname = stem + "_" + out_subdir + ".jpg";
+                fs::path out_path = out_dir / fname;
+                (void)write_jpg(out_path.string(), bufs.final_out.data(), img.width, img.height);
+            }
         }
-        std::cout << "Saved outputs to: " << out_dir.string() << std::endl;
-    }
+    } // End Parallel
 
-    auto ms = total_microseconds / 1000;
-
-    std::cout << "OpenMP enabled: "
-#ifdef _OPENMP
-              << "yes" << std::endl;
-    std::cout << "OpenMP threads: " << omp_get_max_threads() << std::endl;
-#else
-              << "no (compile with /openmp or -fopenmp)" << std::endl;
-#endif
+    std::cout << "Saved outputs to: " << out_dir.string() << std::endl;
+    std::cout << "OpenMP enabled: yes" << std::endl;
+    int max_threads = omp_get_max_threads();
+    const char* env_threads = std::getenv("OMP_NUM_THREADS");
+    if (env_threads) max_threads = std::atoi(env_threads);
+    std::cout << "OpenMP threads: " << max_threads << std::endl; // Approximation
+    
     std::cout << "OpenMP checksum: " << checksum << std::endl;
-    std::cout << "OpenMP time (all filters): " << ms << " ms" << std::endl;
+    auto ms = total_us / 1000;
+    
+    if (filter == "all") std::cout << "OpenMP time (all filters): " << ms << " ms" << std::endl;
+    if(filter == "grayscale") std::cout << "OpenMP time (grayscale): " << ms << " ms" << std::endl;
+    if(filter == "gaussian") std::cout << "OpenMP time (gaussian): " << ms << " ms" << std::endl;
+    if(filter == "edges") std::cout << "OpenMP time (edges): " << ms << " ms" << std::endl;
+    if(filter == "sharpen") std::cout << "OpenMP time (sharpen): " << ms << " ms" << std::endl;
+    if(filter == "brightness") std::cout << "OpenMP time (brightness): " << ms << " ms" << std::endl;
 
     return 0;
 }

@@ -112,14 +112,14 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark threads.exe and openmp.exe vs number of images and thread counts.")
     parser.add_argument("--input-dir", default="input_images", help="Folder containing input images.")
     parser.add_argument("--start", type=int, default=50, help="Starting image count.")
-    parser.add_argument("--end", type=int, default=1000, help="Ending image count (inclusive).")
+    parser.add_argument("--end", type=int, default=250, help="Ending image count (inclusive).")
     parser.add_argument("--step", type=int, default=50, help="Step size for image count.")
     parser.add_argument("--repeats", type=int, default=1, help="Number of runs to average per point.")
     parser.add_argument("--save", default="plots/v1_C_runtime_vs_images.png", help="Path to save the plot PNG.")
     parser.add_argument("--csv", default="plots/v1_C_runtime_data.csv", help="Path to save the CSV results.")
     parser.add_argument("--save-speedup", default="plots/v1_C_speedup_vs_images.png", help="Path to save the speedup plot PNG.")
     parser.add_argument("--csv-speedup", default="plots/v1_C_speedup_data.csv", help="Path to save the speedup CSV results.")
-    parser.add_argument("--thread-counts", default="1,4,8,16", help="Comma-separated list of thread counts to test (applies to both OpenMP and threads.exe via env).")
+    parser.add_argument("--thread-counts", default="1,2,4,8,12,16", help="Comma-separated list of thread counts to test (applies to both OpenMP and threads.exe via env).")
     parser.add_argument("--skip-threads", action="store_true", help="Skip running threads.exe.")
     parser.add_argument("--skip-openmp", action="store_true", help="Skip running openmp.exe.")
     parser.add_argument("--ignore-limit", action="store_true", help="Do not cap counts by available images.")
@@ -297,18 +297,55 @@ def main():
         ensure_plots_dir(png_omp)
         plt.tight_layout()
         plt.savefig(png_omp, dpi=150)
+        plt.tight_layout()
+        plt.savefig(png_omp, dpi=150)
         print(f"Saved plot: {png_omp}")
 
-    # Optional: compute and save speedup vs baseline (1 thread) for each thread count
-    if plt is not None and not args.skip_openmp:
-        # Baseline from OpenMP 1 thread
-        baseline_map = {n: None for n in counts}
+    # Calculate baselines if available
+    baseline_omp = {}
+    if not args.skip_openmp:
         for n in counts:
             for (tc, ms) in results_openmp.get(n, []):
                 if tc == 1:
-                    baseline_map[n] = ms
+                    baseline_omp[n] = ms
                     break
-        # Speedup plots
+
+    baseline_thr = {}
+    if not args.skip_threads:
+        for n in counts:
+            for (tc, ms) in results_threads.get(n, []):
+                if tc == 1:
+                    baseline_thr[n] = ms
+                    break
+
+    # Optional: compute and save speedup vs baseline (1 thread) for each thread count
+    if plt is not None and not args.skip_openmp:
+        # Save speedup CSV for openmp.exe
+        csv_omp_speed_path = (workspace / "plots/v2_C_speedup_openmp_vs1.csv").resolve()
+        ensure_plots_dir(csv_omp_speed_path)
+        with open(csv_omp_speed_path, "w", newline="", encoding="utf-8") as f:
+            f.write("count,baseline_ms," + ",".join([f"openmp_{tc}_speedup" for tc in thread_counts if tc != 1]) + "\n")
+            for n in counts:
+                b = baseline_omp.get(n)
+                row = [str(n), (f"{float(b):.4f}" if b is not None else "")]
+                vals = []
+                for tc in thread_counts:
+                    if tc == 1:
+                        continue
+                    ms = None
+                    for (tcc, val) in results_openmp.get(n, []):
+                        if tcc == tc:
+                            ms = val
+                            break
+                    if b is not None and b > 0 and ms is not None and ms > 0:
+                        vals.append(f"{float(b)/float(ms):.4f}")
+                    else:
+                        vals.append("")
+                row.extend(vals)
+                f.write(",".join(row) + "\n")
+        print(f"Saved openmp speedup CSV: {csv_omp_speed_path}")
+
+        # Speedup plots for OpenMP
         import math
         plt.figure(figsize=(10, 6))
         for tc in thread_counts:
@@ -316,7 +353,7 @@ def main():
                 continue
             ys = []
             for n in counts:
-                b = baseline_map.get(n)
+                b = baseline_omp.get(n)
                 ms = None
                 for (tcc, val) in results_openmp.get(n, []):
                     if tcc == tc:
@@ -340,14 +377,6 @@ def main():
 
     # Speedup graph for threads.exe (baseline: THREADS=1)
     if plt is not None and not args.skip_threads:
-        # Build baseline map from THREADS=1 runs
-        baseline_thr: Dict[int, Optional[float]] = {n: None for n in counts}
-        for n in counts:
-            for (tc, ms) in results_threads.get(n, []):
-                if tc == 1:
-                    baseline_thr[n] = ms
-                    break
-
         # Save speedup CSV for threads.exe
         csv_thr_speed_path = (workspace / "plots/v2_C_speedup_threads_vs1.csv").resolve()
         ensure_plots_dir(csv_thr_speed_path)
@@ -397,12 +426,38 @@ def main():
         plt.title("threads.exe Speedup vs 1 thread baseline")
         plt.grid(True, linestyle="--", alpha=0.4)
         plt.legend()
-        png_thr_speed = (workspace 
-                         / "plots/v2_C_speedup_threads_vs1.png").resolve()
+        png_thr_speed = (workspace / "plots/v2_C_speedup_threads_vs1.png").resolve()
         ensure_plots_dir(png_thr_speed)
-        plt.tight_layout()
-        plt.savefig(png_thr_speed, dpi=150)
-        print(f"Saved speedup plot: {png_thr_speed}")
+        plt.savefig(png_thr_speed)
+        print(f"Saved threads speedup plot: {png_thr_speed}")
+        plt.close()
+
+        # Save speedup CSV for openmp.exe
+        if not args.skip_openmp:
+            csv_omp_speed_path = (workspace / "plots/v2_C_speedup_openmp_vs1.csv").resolve()
+            ensure_plots_dir(csv_omp_speed_path)
+            with open(csv_omp_speed_path, "w", newline="", encoding="utf-8") as f:
+                f.write("count,baseline_ms," + ",".join([f"openmp_{tc}_speedup" for tc in thread_counts if tc != 1]) + "\n")
+                for n in counts:
+                    b = baseline_omp.get(n)
+                    row = [str(n), (f"{float(b):.4f}" if b is not None else "")]
+                    vals = []
+                    for tc in thread_counts:
+                        if tc == 1:
+                            continue
+                        ms = None
+                        for (tcc, val) in results_openmp.get(n, []):
+                            if tcc == tc:
+                                ms = val
+                                break
+                        if b is not None and b > 0 and ms is not None and ms > 0:
+                            vals.append(f"{float(b)/float(ms):.4f}")
+                        else:
+                            vals.append("")
+                    row.extend(vals)
+                    f.write(",".join(row) + "\n")
+            print(f"Saved openmp speedup CSV: {csv_omp_speed_path}") 
+
 
     # Optionally show interactively if running locally
     if os.environ.get("SHOW_PLOT", "0") == "1":
