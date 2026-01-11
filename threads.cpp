@@ -9,13 +9,14 @@
 #include "src/filters.h"
 #include <fstream>
 #include <cctype>
+#include <cstring>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
+#include "third_party/stb/stb_image_write.h"
 
 #undef STBI_NO_STDIO
 #define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
+#include "third_party/stb/stb_image.h"
 
 namespace fs = std::filesystem;
 
@@ -23,7 +24,16 @@ struct Image
 {
     int width = 0;
     int height = 0;
-    std::vector<uint8_t> gray; // 8-bit grayscale
+    std::vector<uint8_t> rgb; // 3-channel RGB
+};
+
+struct PipelineTimings
+{
+    long long grayscale_us = 0;
+    long long gaussian_us = 0;
+    long long edges_us = 0;
+    long long sharpen_us = 0;
+    long long brightness_us = 0;
 };
 
 static unsigned int determine_threads()
@@ -46,7 +56,7 @@ static unsigned int determine_threads()
     return nt;
 }
 
-static bool load_grayscale_image(const std::string &path, Image &out)
+static bool load_image(const std::string &path, Image &out)
 {
     int w = 0, h = 0, ch = 0;
     stbi_uc *data = stbi_load(path.c_str(), &w, &h, &ch, 3); // load 3-channel (BGR)
@@ -55,9 +65,10 @@ static bool load_grayscale_image(const std::string &path, Image &out)
 
     out.width = w;
     out.height = h;
-    out.gray.resize(static_cast<size_t>(w) * static_cast<size_t>(h));
-    filters::rgb_to_grayscale(reinterpret_cast<const uint8_t *>(data), out.gray.data(), w, h, /*bgr=*/true);
-    free(data);
+    size_t num_pixels = static_cast<size_t>(w) * h;
+    out.rgb.resize(num_pixels * 3);
+    std::memcpy(out.rgb.data(), data, num_pixels * 3);
+    stbi_image_free(data);
     return true;
 }
 
@@ -90,83 +101,112 @@ static std::vector<std::string> list_image_files(const std::string &folder)
     return files;
 }
 
-static bool write_png(const std::string &filepath, const uint8_t *data, int w, int h)
+static bool write_jpg(const std::string &filepath, const uint8_t *data, int w, int h)
 {
     // write grayscale PNG; stride = w bytes
-    int ok = stbi_write_png(filepath.c_str(), w, h, 1, data, w);
+    int ok = stbi_write_jpg(filepath.c_str(), w, h, 1, data, 100);
     return ok != 0;
 }
 
-static void apply_filter_rows(const std::string &filter, const uint8_t *in, uint8_t *out, int w, int h, int y0, int y1, int beta = 50)
+// Helper to apply all filters on a range of rows
+static void apply_pipeline_rows(const Image &img, 
+                                std::vector<uint8_t> &gray,
+                                std::vector<uint8_t> &blur,
+                                std::vector<uint8_t> &edges,
+                                std::vector<uint8_t> &sharp,
+                                std::vector<uint8_t> &brightness,
+                                int w, int h, int y0, int y1, float gamma,
+                                PipelineTimings &t_local)
 {
-    if (filter == "gaussian" || filter == "blur")
-    {
-        filters::gaussian_blur_rows_gray(in, out, w, h, y0, y1);
-    }
-    else if (filter == "edges" || filter == "sobel")
-    {
-        filters::sobel_rows_gray(in, out, w, h, y0, y1);
-    }
-    else if (filter == "sharpen")
-    {
-        filters::sharpen_rows_gray(in, out, w, h, y0, y1);
-    }
-    else if (filter == "brightness")
-    {
-        // Increase brightness by 50% (scale by 1.5)
-        for (int y = y0; y < y1; ++y)
-        {
-            const uint8_t *row_in = in + y * w;
-            uint8_t *row_out = out + y * w;
-            for (int x = 0; x < w; ++x)
-            {
-                int v = static_cast<int>(std::lround(row_in[x] * 1.5));
-                row_out[x] = static_cast<uint8_t>(filters::clamp(v, 0, 255));
-            }
-        }
-    }
-    else if (filter == "grayscale")
-    {
-        // Already grayscale; copy rows
-        for (int y = y0; y < y1; ++y)
-            std::copy(in + y * w, in + (y + 1) * w, out + y * w);
-    }
-    else
-    {
-        // Default to gaussian blur
-        filters::gaussian_blur_rows_gray(in, out, w, h, y0, y1);
-    }
+    // 1. Grayscale
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int y = y0; y < y1; ++y)
+        filters::rgb_to_grayscale_row(img.rgb.data() + y*w*3, gray.data() + y*w, w, /*bgr=*/true);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    t_local.grayscale_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+    // 2. Gaussian
+    t0 = std::chrono::high_resolution_clock::now();
+    filters::gaussian_blur_rows_gray(gray.data(), blur.data(), w, h, y0, y1);
+    t1 = std::chrono::high_resolution_clock::now();
+    t_local.gaussian_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+    // 3. Edges
+    t0 = std::chrono::high_resolution_clock::now();
+    filters::sobel_rows_gray(blur.data(), edges.data(), w, h, y0, y1);
+    t1 = std::chrono::high_resolution_clock::now();
+    t_local.edges_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+    // 4. Sharpen
+    t0 = std::chrono::high_resolution_clock::now();
+    filters::sharpen_rows_gray(edges.data(), sharp.data(), w, h, y0, y1);
+    t1 = std::chrono::high_resolution_clock::now();
+    t_local.sharpen_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+    // 5. Brightness
+    t0 = std::chrono::high_resolution_clock::now();
+    filters::brightness_rows_gray(sharp.data(), brightness.data(), w, h, y0, y1, gamma);
+    t1 = std::chrono::high_resolution_clock::now();
+    t_local.brightness_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
 }
 
-static void run_filter_with_threads(const Image &img, const std::string &filter, int beta, std::vector<uint8_t> &out)
+static PipelineTimings run_pipeline_with_threads(const Image &img, float gamma, std::vector<uint8_t> &final_out, const std::string &return_stage)
 {
+    PipelineTimings total_times;
     const int w = img.width;
     const int h = img.height;
-    out.resize(static_cast<size_t>(w) * h);
+    size_t num_pixels = static_cast<size_t>(w) * h;
+    
+    // Allocate intermediate buffers
+    std::vector<uint8_t> gray(num_pixels);
+    std::vector<uint8_t> blur(num_pixels);
+    std::vector<uint8_t> edges(num_pixels);
+    std::vector<uint8_t> sharp(num_pixels);
+    std::vector<uint8_t> brightness(num_pixels);
+    final_out.resize(num_pixels);
+
     unsigned int nt = determine_threads();
     int rows_per = (h + static_cast<int>(nt) - 1) / static_cast<int>(nt);
 
     std::vector<std::thread> threads;
+    std::vector<PipelineTimings> thread_times(nt);
+
     for (unsigned int t = 0; t < nt; ++t)
     {
         int y0 = static_cast<int>(t) * rows_per;
         int y1 = std::min(h, y0 + rows_per);
         if (y0 >= h)
             break;
-        threads.emplace_back([&img, &out, w, h, y0, y1, &filter, beta]()
-                             { apply_filter_rows(filter, img.gray.data(), out.data(), w, h, y0, y1, beta); });
+        threads.emplace_back([&, t, y0, y1]() {
+            apply_pipeline_rows(img, gray, blur, edges, sharp, brightness, w, h, y0, y1, gamma, thread_times[t]);
+        });
     }
     for (auto &th : threads)
         th.join();
+    
+    for (const auto &t : thread_times) {
+        if(t.grayscale_us > total_times.grayscale_us) total_times.grayscale_us = t.grayscale_us;
+        if(t.gaussian_us > total_times.gaussian_us) total_times.gaussian_us = t.gaussian_us;
+        if(t.edges_us > total_times.edges_us) total_times.edges_us = t.edges_us;
+        if(t.sharpen_us > total_times.sharpen_us) total_times.sharpen_us = t.sharpen_us;
+        if(t.brightness_us > total_times.brightness_us) total_times.brightness_us = t.brightness_us;
+    }
 
-    (void)out;
+    // Copy requested stage to final_out
+    if (return_stage == "grayscale") final_out = gray;
+    else if (return_stage == "gaussian") final_out = blur;
+    else if (return_stage == "edges") final_out = edges;
+    else if (return_stage == "sharpen") final_out = sharp;
+    else final_out = brightness; // "brightness" or "all"
+
+    return total_times;
 }
 
 int main(int argc, char **argv)
 {
     std::string folder = "input_images";
     std::string filter = "all"; // default: run all 5 filters
-    int beta = 50;              // (unused for percentage brightness)
+    float gamma = 0.9f;              // (unused for percentage brightness)
     size_t max_images = 0;      // 0 means process all
     if (argc > 1)
         folder = argv[1];
@@ -208,7 +248,7 @@ int main(int argc, char **argv)
     {
         const auto &path = files[i];
         Image img;
-        if (load_grayscale_image(path, img))
+        if (load_image(path, img))
             images.push_back(std::move(img));
         else
             std::cerr << "Failed to load: " << path << std::endl;
@@ -231,45 +271,51 @@ int main(int argc, char **argv)
     }
 
     uint64_t checksum_total = 0;
-    long long total_microseconds = 0;
+    long long total_us = 0;
+    
+    // Create output directory for the specific filter
+    std::string out_subdir = (filter == "all") ? "pipeline_final" : filter;
+    fs::path out_dir = fs::path("output_images") / out_subdir;
+    fs::create_directories(out_dir);
 
-    for (const auto &filt : filters_to_run)
+    for (size_t i = 0; i < images.size(); ++i)
     {
-        // Map folder names per requirement
-        std::string folder_name = filt;
-        if (filt == "gaussian")
-            folder_name = "gaussian_blur";
-        else if (filt == "edges")
-            folder_name = "edge_detection";
-        else if (filt == "brightness")
-            folder_name = "brightness_adjustment";
-        fs::path out_dir = fs::path("output_images") / folder_name;
-        fs::create_directories(out_dir);
-
         std::vector<uint8_t> out;
-        for (size_t i = 0; i < images.size(); ++i)
-        {
-            auto t_start = std::chrono::high_resolution_clock::now();
-            run_filter_with_threads(images[i], filt, beta, out);
-            auto t_end = std::chrono::high_resolution_clock::now();
-            total_microseconds += std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
-
-            for (uint8_t v : out)
-                checksum_total += v;
-            fs::path in_path = files[i];
-            std::string stem = in_path.empty() ? ("img_" + std::to_string(i)) : fs::path(in_path).stem().string();
-            std::string fname = stem + "_" + folder_name;
-            // fs::path out_path = out_dir / (fname + ".png");
-            // (void)write_png(out_path.string(), out.data(), images[i].width, images[i].height);
+        PipelineTimings times = run_pipeline_with_threads(images[i], gamma, out, filter);
+        
+        long long img_total = 0;
+        for (const auto &filt : filters_to_run) {
+           long long t = 0;
+           if(filt == "grayscale") t = times.grayscale_us;
+           else if(filt == "gaussian" || filt == "blur") t = times.gaussian_us;
+           else if(filt == "edges" || filt == "sobel") t = times.edges_us;
+           else if(filt == "sharpen") t = times.sharpen_us;
+           else if(filt == "brightness") t = times.brightness_us;
+           total_us += t;
+           img_total += t;
         }
-        std::cout << "Saved outputs to: " << out_dir.string() << std::endl;
-    }
 
-    auto ms = total_microseconds / 1000;
+        for (uint8_t v : out) checksum_total += v;
+
+        fs::path in_path = files[i];
+        std::string stem = in_path.empty() ? ("img_" + std::to_string(i)) : fs::path(in_path).stem().string();
+        std::string fname = stem + "_" + out_subdir + ".jpg";
+        fs::path out_path = out_dir / fname;
+        (void)write_jpg(out_path.string(), out.data(), images[i].width, images[i].height);
+    }
+    std::cout << "Saved outputs to: " << out_dir.string() << std::endl;
+
+    auto ms = total_us / 1000;
     std::cout << "Threads used: " << determine_threads() << std::endl;
 
     std::cout << "Threads checksum: " << checksum_total << std::endl;
-    std::cout << "Threads time (all filters): " << ms << " ms" << std::endl;
+
+    if (filter == "all") std::cout << "Threads time (all filters): " << ms << " ms" << std::endl;
+    if(filter == "grayscale") std::cout << "Threads time (grayscale): " << ms << " ms" << std::endl;
+    if(filter == "gaussian") std::cout << "Threads time (gaussian): " << ms << " ms" << std::endl;
+    if(filter == "edges") std::cout << "Threads time (edges): " << ms << " ms" << std::endl;
+    if(filter == "sharpen") std::cout << "Threads time (sharpen): " << ms << " ms" << std::endl;
+    if(filter == "brightness") std::cout << "Threads time (brightness): " << ms << " ms" << std::endl;
 
     return 0;
 }

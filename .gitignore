@@ -2,6 +2,13 @@
 # CST435 Assignment 2 - Parallel Image Processing
 # ============================================================================
 
+#binaries
+openmp
+openmp.exe
+threads
+threads.exe
+
+
 # Output images (processed results - do not track)
 output_images/
 

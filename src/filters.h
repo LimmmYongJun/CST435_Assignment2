@@ -13,33 +13,38 @@ namespace filters
 
     // Convert 3-channel RGB (or BGR) to grayscale using luminance
     // Assumes input layout: [y*w*3 + x*3 + 0..2]
+    inline void rgb_to_grayscale_row(const uint8_t *row, uint8_t *gout, int w, bool bgr)
+    {
+        for (int x = 0; x < w; ++x)
+        {
+            uint8_t c0 = row[x * 3 + 0];
+            uint8_t c1 = row[x * 3 + 1];
+            uint8_t c2 = row[x * 3 + 2];
+            double R, G, B;
+            if (bgr)
+            {
+                B = c0;
+                G = c1;
+                R = c2;
+            }
+            else
+            {
+                R = c0;
+                G = c1;
+                B = c2;
+            }
+            int v = static_cast<int>(0.2126 * R + 0.7152 * G + 0.0722 * B + 0.5);
+            gout[x] = static_cast<uint8_t>(clamp(v, 0, 255));
+        }
+    }
+
     inline void rgb_to_grayscale(const uint8_t *rgb, uint8_t *gray, int w, int h, bool bgr = true)
     {
         for (int y = 0; y < h; ++y)
         {
             const uint8_t *row = rgb + y * w * 3;
             uint8_t *gout = gray + y * w;
-            for (int x = 0; x < w; ++x)
-            {
-                uint8_t c0 = row[x * 3 + 0];
-                uint8_t c1 = row[x * 3 + 1];
-                uint8_t c2 = row[x * 3 + 2];
-                double R, G, B;
-                if (bgr)
-                {
-                    B = c0;
-                    G = c1;
-                    R = c2;
-                }
-                else
-                {
-                    R = c0;
-                    G = c1;
-                    B = c2;
-                }
-                int v = static_cast<int>(0.2126 * R + 0.7152 * G + 0.0722 * B + 0.5);
-                gout[x] = static_cast<uint8_t>(clamp(v, 0, 255));
-            }
+            rgb_to_grayscale_row(row, gout, w, bgr);
         }
     }
 
@@ -155,20 +160,22 @@ namespace filters
     }
 
     // Brightness adjust on grayscale
-    inline void brightness_row_gray(const uint8_t *in, uint8_t *out, int w, int h, int y, int beta)
+    inline void brightness_row_gray(const uint8_t *in, uint8_t *out, int w, int h, int y, float gamma = 1.1f)
     {
         const uint8_t *row_in = in + y * w;
         uint8_t *row_out = out + y * w;
         for (int x = 0; x < w; ++x)
         {
-            row_out[x] = static_cast<uint8_t>(clamp(static_cast<int>(row_in[x]) + beta, 0, 255));
+            double v = row_in[x] / 255.0;
+            double res = std::pow(v, gamma) * 255.0;
+            row_out[x] = static_cast<uint8_t>(clamp(static_cast<int>(res), 0, 255));
         }
     }
 
-    inline void brightness_rows_gray(const uint8_t *in, uint8_t *out, int w, int h, int y0, int y1, int beta)
+    inline void brightness_rows_gray(const uint8_t *in, uint8_t *out, int w, int h, int y0, int y1, float gamma)
     {
         for (int y = y0; y < y1; ++y)
-            brightness_row_gray(in, out, w, h, y, beta);
+            brightness_row_gray(in, out, w, h, y, gamma);
     }
 
 } // namespace filters

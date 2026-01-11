@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <cctype>
+#include <cstring>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -14,7 +15,7 @@
 
 #undef STBI_NO_STDIO
 #define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
+#include "third_party/stb/stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "third_party/stb/stb_image_write.h"
 #include "src/filters.h"
@@ -24,10 +25,19 @@ struct Image
 {
     int width = 0;
     int height = 0;
-    std::vector<uint8_t> gray; // 8-bit grayscale
+    std::vector<uint8_t> rgb; // 3-channel RGB
 };
 
-static bool load_grayscale_image(const std::string &path, Image &out)
+struct PipelineTimings
+{
+    long long grayscale_us = 0;
+    long long gaussian_us = 0;
+    long long edges_us = 0;
+    long long sharpen_us = 0;
+    long long brightness_us = 0;
+};
+
+static bool load_image(const std::string &path, Image &out)
 {
     int w = 0, h = 0, ch = 0;
     stbi_uc *data = stbi_load(path.c_str(), &w, &h, &ch, 3); // load 3-channel
@@ -35,8 +45,9 @@ static bool load_grayscale_image(const std::string &path, Image &out)
         return false;
     out.width = w;
     out.height = h;
-    out.gray.resize(static_cast<size_t>(w) * static_cast<size_t>(h));
-    filters::rgb_to_grayscale(reinterpret_cast<const uint8_t *>(data), out.gray.data(), w, h, /*bgr=*/false);
+    size_t num_pixels = static_cast<size_t>(w) * static_cast<size_t>(h);
+    out.rgb.resize(num_pixels * 3);
+    std::memcpy(out.rgb.data(), data, num_pixels * 3);
     stbi_image_free(data);
     return true;
 }
@@ -70,73 +81,81 @@ static std::vector<std::string> list_image_files(const std::string &folder)
     return files;
 }
 
-static bool write_png(const std::string &filepath, const uint8_t *data, int w, int h)
+static bool write_jpg(const std::string &filepath, const uint8_t *data, int w, int h)
 {
-    return stbi_write_png(filepath.c_str(), w, h, 1, data, w) != 0;
+    return stbi_write_jpg(filepath.c_str(), w, h, 1, data, 100) != 0;
 }
 
-static void run_filter_with_openmp(const Image &img, const std::string &filter, int beta, std::vector<uint8_t> &out)
+static PipelineTimings run_pipeline_with_openmp(const Image &img, float gamma, std::vector<uint8_t> &final_out, const std::string &return_stage)
 {
-    const int w = img.width;
-    const int h = img.height;
-    out.resize(static_cast<size_t>(w) * h);
+    PipelineTimings times;
+    int w = img.width;
+    int h = img.height;
+    size_t num_pixels = static_cast<size_t>(w) * h;
 
-    auto clamp = [](int v, int lo, int hi)
-    { return v < lo ? lo : (v > hi ? hi : v); };
+    // Buffers for intermediate stages
+    std::vector<uint8_t> gray(num_pixels);
+    std::vector<uint8_t> blur(num_pixels);
+    std::vector<uint8_t> edges(num_pixels);
+    std::vector<uint8_t> sharp(num_pixels);
+    std::vector<uint8_t> brightness(num_pixels);
+    final_out.resize(num_pixels);
 
-    if (filter == "gaussian" || filter == "blur")
-    {
-#pragma omp parallel for schedule(static)
-        for (int y = 0; y < h; ++y)
-            filters::gaussian_blur_row_gray(img.gray.data(), out.data(), w, h, y);
-    }
-    else if (filter == "edges" || filter == "sobel")
-    {
-#pragma omp parallel for schedule(static)
-        for (int y = 0; y < h; ++y)
-            filters::sobel_row_gray(img.gray.data(), out.data(), w, h, y);
-    }
-    else if (filter == "sharpen")
-    {
-#pragma omp parallel for schedule(static)
-        for (int y = 0; y < h; ++y)
-            filters::sharpen_row_gray(img.gray.data(), out.data(), w, h, y);
-    }
-    else if (filter == "brightness")
-    {
-#pragma omp parallel for schedule(static)
-        for (int y = 0; y < h; ++y)
-        {
-            const uint8_t *row_in = img.gray.data() + y * w;
-            uint8_t *row_out = out.data() + y * w;
-            for (int x = 0; x < w; ++x)
-            {
-                int v = static_cast<int>(std::lround(row_in[x] * 1.5));
-                row_out[x] = static_cast<uint8_t>(filters::clamp(v, 0, 255));
-            }
-        }
-    }
-    else if (filter == "grayscale")
-    {
-#pragma omp parallel for schedule(static)
-        for (int y = 0; y < h; ++y)
-            std::copy(img.gray.data() + y * w, img.gray.data() + (y + 1) * w, out.data() + y * w);
-    }
-    else
-    {
-#pragma omp parallel for schedule(static)
-        for (int y = 0; y < h; ++y)
-            filters::gaussian_blur_row_gray(img.gray.data(), out.data(), w, h, y);
-    }
+    // 1. Grayscale
+    auto t0 = std::chrono::high_resolution_clock::now();
+    #pragma omp parallel for schedule(static)
+    for(int y=0; y<h; ++y) 
+        filters::rgb_to_grayscale_row(img.rgb.data() + y*w*3, gray.data() + y*w, w, /*bgr=*/false);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    times.grayscale_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
 
-    (void)out;
+    // 2. Gaussian (Input: gray, Output: blur)
+    t0 = std::chrono::high_resolution_clock::now();
+    #pragma omp parallel for schedule(static)
+    for(int y=0; y<h; ++y)
+        filters::gaussian_blur_row_gray(gray.data(), blur.data(), w, h, y);
+    t1 = std::chrono::high_resolution_clock::now();
+    times.gaussian_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+    // 3. Edges (Input: blur, Output: edges)
+    t0 = std::chrono::high_resolution_clock::now();
+    #pragma omp parallel for schedule(static)
+    for(int y=0; y<h; ++y)
+        filters::sobel_row_gray(blur.data(), edges.data(), w, h, y);
+    t1 = std::chrono::high_resolution_clock::now();
+    times.edges_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+    // 4. Sharpen (Input: edges, Output: sharp)
+    t0 = std::chrono::high_resolution_clock::now();
+    #pragma omp parallel for schedule(static)
+    for(int y=0; y<h; ++y)
+        filters::sharpen_row_gray(edges.data(), sharp.data(), w, h, y);
+    t1 = std::chrono::high_resolution_clock::now();
+    times.sharpen_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+    // 5. Brightness (Input: sharp, Output: brightness)
+    t0 = std::chrono::high_resolution_clock::now();
+    #pragma omp parallel for schedule(static)
+    for(int y=0; y<h; ++y)
+        filters::brightness_row_gray(sharp.data(), brightness.data(), w, h, y, gamma);
+    t1 = std::chrono::high_resolution_clock::now();
+    times.brightness_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+    // Copy requested stage to final_out
+    if (return_stage == "grayscale") final_out = gray;
+    else if (return_stage == "gaussian") final_out = blur;
+    else if (return_stage == "edges") final_out = edges;
+    else if (return_stage == "sharpen") final_out = sharp;
+    else final_out = brightness; // "brightness" or "all"
+
+    return times;
 }
 
 int main(int argc, char **argv)
 {
     std::string folder = "input_images";
     std::string filter = "all";
-    int beta = 50;
+    float gamma = 0.9f;
     size_t max_images = 0; // 0 means process all
     if (argc > 1)
         folder = argv[1];
@@ -178,7 +197,7 @@ int main(int argc, char **argv)
     {
         const auto &path = files[i];
         Image img;
-        if (load_grayscale_image(path, img))
+        if (load_image(path, img))
             images.push_back(std::move(img));
         else
             std::cerr << "Failed to load: " << path << std::endl;
@@ -197,39 +216,44 @@ int main(int argc, char **argv)
         filters_to_run = {filter};
 
     uint64_t checksum = 0;
-    std::vector<uint8_t> out;
-    long long total_microseconds = 0;
+    long long total_us = 0;
+    
+    // Create output directory for the specific filter
+    std::string out_subdir = (filter == "all") ? "pipeline_final" : filter;
+    fs::path out_dir = fs::path("output_images") / out_subdir;
+    fs::create_directories(out_dir);
 
-    for (const auto &filt : filters_to_run)
+    for (size_t i = 0; i < images.size(); ++i)
     {
-        std::string folder_name = filt;
-        if (filt == "gaussian")
-            folder_name = "gaussian_blur";
-        else if (filt == "edges")
-            folder_name = "edge_detection";
-        else if (filt == "brightness")
-            folder_name = "brightness_adjustment";
-        fs::path out_dir = fs::path("output_images") / folder_name;
-        fs::create_directories(out_dir);
-        for (size_t i = 0; i < images.size(); ++i)
-        {
-            auto t_start = std::chrono::high_resolution_clock::now();
-            run_filter_with_openmp(images[i], filt, beta, out);
-            auto t_end = std::chrono::high_resolution_clock::now();
-            total_microseconds += std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
-
-            for (uint8_t v : out)
-                checksum += v;
-            fs::path in_path = files[i];
-            std::string stem = in_path.empty() ? ("img_" + std::to_string(i)) : fs::path(in_path).stem().string();
-            std::string fname = stem + "_" + folder_name;
-            // fs::path out_path = out_dir / (fname + ".png");
-            // (void)write_png(out_path.string(), out.data(), images[i].width, images[i].height);
+        std::vector<uint8_t> out;
+        PipelineTimings times = run_pipeline_with_openmp(images[i], gamma, out, filter);
+        
+        long long img_total = 0;
+        // Accumulate timing based on what user asked to measure
+        for (const auto &filt : filters_to_run) {
+           long long t = 0;
+           if(filt == "grayscale") t = times.grayscale_us;
+           else if(filt == "gaussian" || filt == "blur") t = times.gaussian_us;
+           else if(filt == "edges" || filt == "sobel") t = times.edges_us;
+           else if(filt == "sharpen") t = times.sharpen_us;
+           else if(filt == "brightness") t = times.brightness_us;
+           total_us += t;
+           img_total += t;
         }
-        std::cout << "Saved outputs to: " << out_dir.string() << std::endl;
-    }
 
-    auto ms = total_microseconds / 1000;
+        // Just use simple checksum on final output
+        for (uint8_t v : out) checksum += v;
+        
+        // Save output
+        fs::path in_path = files[i];
+        std::string stem = in_path.empty() ? ("img_" + std::to_string(i)) : fs::path(in_path).stem().string();
+        std::string fname = stem + "_" + out_subdir + ".jpg";
+        fs::path out_path = out_dir / fname;
+        (void)write_jpg(out_path.string(), out.data(), images[i].width, images[i].height);
+    }
+    std::cout << "Saved outputs to: " << out_dir.string() << std::endl;
+
+    auto ms = total_us / 1000;
 
     std::cout << "OpenMP enabled: "
 #ifdef _OPENMP
